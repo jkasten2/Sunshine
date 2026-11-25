@@ -602,6 +602,17 @@
     "unknown_device": "Unknown device",
     "warning_msg": "Make sure you have access to the client you are pairing with. This software can give total control to your computer, so be careful!"
   },
+  "reconnect": {
+    "accept": "Accept",
+    "approve_success": "Connection approved",
+    "banner_label": "Pending device connection requests",
+    "deny": "Deny",
+    "deny_success": "Connection denied",
+    "launch_prompt": "{name} ({address}) is requesting to start a stream.",
+    "resolve_failure": "Unable to respond to the connection request",
+    "resume_prompt": "{name} ({address}) is requesting to resume the current stream.",
+    "title": "Incoming Connection Request"
+  },
   "resource_card": {
     "documentation": "Documentation",
     "github_discussions": "GitHub Discussions",
@@ -655,6 +666,8 @@
     "permission_notifications": "Notifications",
     "permission_notifications_desc": "Allows optional menu bar and streaming alerts.",
     "change_gamepad_driver": "Change Gamepad Backend",
+    "client_enabled": "Enabled",
+    "client_require_accept": "Require Approval on Reconnect",
     "dd_reset": "Reset Persistent Display Device Settings",
     "dd_reset_desc": "If Sunshine is stuck trying to restore the changed display device settings, you can reset the settings and proceed to restore the display state manually.",
     "dd_reset_error": "Error while resetting persistence!",
@@ -698,6 +711,7 @@
     "unpair_all_error": "Error while unpairing",
     "unpair_all_success": "All devices unpaired.",
     "unpair_desc": "Remove your paired devices. Individually unpaired devices with an active session will remain connected, but cannot start or resume a session.",
+    "unpair_single": "Unpair Device",
     "unpair_single_no_devices": "There are no paired devices.",
     "unpair_single_success": "However, the device(s) may still be in an active session. Use the 'Force Close' button above to end any open sessions.",
     "unpair_single_unknown": "Unknown Client",

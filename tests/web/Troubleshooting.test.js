@@ -19,7 +19,7 @@ import en from '../../src_assets/common/assets/web/public/assets/locale/en.json'
  * @param {object|null} i18n Optional Vue I18n plugin.
  * @return {Promise<object>} Mounted troubleshooting wrapper.
  */
-async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {}, permissions = [], i18n = null) {
+async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {}, permissions = [], i18n = null, clients = []) {
   vi.stubGlobal('fetch', vi.fn(async (url) => {
     if (url === '/api/config') {
       return { json: async () => ({ platform, gamepad_driver: gamepadDriver }) }
@@ -50,7 +50,10 @@ async function mountTroubleshooting(platform, gamepadDriver, licenseStatus = {},
       return { text: async () => '' }
     }
     if (url === './api/clients/list') {
-      return { json: async () => ({ status: true, named_certs: [] }) }
+      return { ok: true, json: async () => ({ status: true, named_certs: clients }) }
+    }
+    if (url === './api/clients/update') {
+      return { ok: true, status: 200, json: async () => ({ status: true }) }
     }
     return {
       ok: true,
@@ -88,7 +91,7 @@ describe('virtual input troubleshooting', () => {
     catalog.troubleshooting.unpair_title = 'Translated unpair'
     catalog.troubleshooting.logs = 'Translated logs'
 
-    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'error').mockImplementation(() => { })
     vi.stubGlobal('fetch', vi.fn(async url => ({
       json: async () => url === './api/configLocale' ? { locale: 'de' } : catalog,
     })))
@@ -292,6 +295,39 @@ describe('virtual input troubleshooting', () => {
       'troubleshooting.permissions_status_not_determined',
     ])
     expect(wrapper.findAll('.permission-table-shell tbody button')).toHaveLength(2)
+    wrapper.unmount()
+  })
+
+  it('renders paired devices with labeled enable and reconnect approval switches', async () => {
+    const wrapper = await mountTroubleshooting('linux', 'none', {}, [], null, [
+      { uuid: 'uuid-1', name: 'Steam Deck', enabled: true, require_accept: false },
+      { uuid: 'uuid-2', name: '', enabled: false, require_accept: true },
+    ])
+
+    const requireAcceptSwitch = wrapper.get('#require-accept-uuid-1')
+    const enabledSwitch = wrapper.get('#toggle-uuid-1')
+    expect(wrapper.get('label[for="require-accept-uuid-1"]').text()).toBe('troubleshooting.client_require_accept')
+    expect(wrapper.get('label[for="toggle-uuid-1"]').text()).toBe('troubleshooting.client_enabled')
+    expect(requireAcceptSwitch.element.checked).toBe(false)
+    expect(enabledSwitch.element.checked).toBe(true)
+
+    const secondRequireAccept = wrapper.get('#require-accept-uuid-2')
+    expect(secondRequireAccept.element.checked).toBe(true)
+
+    await requireAcceptSwitch.trigger('change')
+    await flushPromises()
+    expect(fetch).toHaveBeenCalledWith('./api/clients/update', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ uuid: 'uuid-1', require_accept: true }),
+    }))
+
+    await enabledSwitch.trigger('change')
+    await flushPromises()
+    expect(fetch).toHaveBeenCalledWith('./api/clients/update', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ uuid: 'uuid-1', enabled: false }),
+    }))
+
     wrapper.unmount()
   })
 })

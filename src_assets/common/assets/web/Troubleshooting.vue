@@ -451,18 +451,31 @@
         </div>
       </div>
       <ul class="list-group list-group-flush" v-if="clients && clients.length > 0">
-        <li v-for="client in clients" :key="client.uuid" class="list-group-item d-flex align-items-center">
+        <li v-for="client in clients" :key="client.uuid" class="list-group-item d-flex flex-wrap align-items-center gap-3">
           <div class="flex-grow-1">
             {{ client.name !== "" ? client.name : $t('troubleshooting.unpair_single_unknown') }}
           </div>
-          <div class="form-check form-switch ms-2 mb-0">
+          <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" role="switch"
+                   :id="'require-accept-' + client.uuid"
+                   :checked="Boolean(client.require_accept)"
+                   :aria-checked="Boolean(client.require_accept).toString()"
+                   @change="toggleClientRequireAccept(client.uuid, !client.require_accept)">
+            <label class="form-check-label" :for="'require-accept-' + client.uuid">
+              {{ $t('troubleshooting.client_require_accept') }}
+            </label>
+          </div>
+          <div class="form-check form-switch mb-0">
             <input class="form-check-input" type="checkbox" role="switch"
                    :id="'toggle-' + client.uuid"
                    :checked="client.enabled"
                    :aria-checked="client.enabled.toString()"
                    @change="toggleClient(client.uuid, !client.enabled)">
+            <label class="form-check-label" :for="'toggle-' + client.uuid">
+              {{ $t('troubleshooting.client_enabled') }}
+            </label>
           </div>
-          <button class="btn btn-danger btn-sm ms-2" @click="unpairSingle(client.uuid)">
+          <button class="btn btn-danger btn-sm" :aria-label="$t('troubleshooting.unpair_single')" @click="unpairSingle(client.uuid)">
             <trash-2 :size="18" class="icon"></trash-2>
           </button>
         </li>
@@ -917,12 +930,23 @@
           });
         },
         toggleClient(uuid, enabled) {
-          fetch("./api/clients/update", {
+          apiFetch("./api/clients/update", {
             method: "POST",
             headers: {
               'Content-Type': 'application/json'
             },
             body: JSON.stringify({ uuid, enabled })
+          }).then(() => {
+            this.refreshClients();
+          });
+        },
+        toggleClientRequireAccept(uuid, require_accept) {
+          apiFetch("./api/clients/update", {
+            method: "POST",
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ uuid, require_accept })
           }).then(() => {
             this.refreshClients();
           });

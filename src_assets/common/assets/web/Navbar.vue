@@ -78,6 +78,7 @@
       </div>
     </nav>
     <Notification></Notification>
+    <ReconnectBanner ref="reconnectBanner"></ReconnectBanner>
   </div>
 </template>
 
@@ -85,11 +86,13 @@
 import { CircleUserRound, Home, Info, Layers, Lock, LogOut, Settings, Shield, Star } from '@lucide/vue'
 import ThemeToggle from './ThemeToggle.vue'
 import Notification from './Notification.vue'
+import ReconnectBanner from './ReconnectBanner.vue'
 
 export default {
   components: {
     ThemeToggle,
     Notification,
+    ReconnectBanner,
     Home,
     Lock,
     Layers,
@@ -102,6 +105,7 @@ export default {
   },
   methods: {
     logout() {
+      this.$refs.reconnectBanner?.stopReconnectPolling()
       const cacheBuster = Date.now().toString()
       const logoutPageUrl = new URL('/logout', globalThis.location.href)
       const request = new XMLHttpRequest()

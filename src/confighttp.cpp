@@ -1429,18 +1429,19 @@ namespace confighttp {
   }
 
   /**
-   * @brief Enable or disable a client.
+   * @brief Update per-device settings for a paired client.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
    * The body for the POST request should be JSON serialized in the following format:
    * @code{.json}
    * {
    *   "uuid": "<uuid>",
-   *   "enabled": true
+   *   "enabled": true,
+   *   "require_accept": false
    * }
    * @endcode
    *
-   * @api_examples{/api/clients/update|:| POST|:| {"uuid":"<uuid>","enabled":true}}
+   * @api_examples{/api/clients/update|:| POST|:| {"uuid":"<uuid>","enabled":true,"require_accept":false}}
    */
   void updateClient(resp_https_t response, req_https_t request) {
     if (!check_content_type(response, request, "application/json")) {
@@ -1460,25 +1461,147 @@ namespace confighttp {
     ss << request->content.rdbuf();
     try {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
-      nlohmann::json output_tree;
-      std::string uuid = input_tree.value("uuid", "");
-      bool enabled = input_tree.value("enabled", true);
-      output_tree["status"] = nvhttp::set_client_enabled(uuid, enabled);
-
-      if (!enabled && output_tree["status"]) {
-        auto cert = nvhttp::get_cert_by_uuid(uuid);
-        if (!cert.empty()) {
-          rtsp_stream::terminate_sessions_by_cert(cert);
-        }
-
-        if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
-          proc::proc.terminate();
-        }
+      if (!input_tree.is_object() || !input_tree.contains("uuid") || !input_tree["uuid"].is_string()) {
+        bad_request(response, "uuid must be a string");
+        return;
       }
 
+      const std::string uuid = input_tree["uuid"].get<std::string>();
+      if (uuid.empty()) {
+        bad_request(response, "uuid is required");
+        return;
+      }
+
+      const bool has_enabled = input_tree.contains("enabled");
+      const bool has_require_accept = input_tree.contains("require_accept");
+      if (!has_enabled && !has_require_accept) {
+        bad_request(response, "At least one client setting must be provided");
+        return;
+      }
+      if (has_enabled && !input_tree["enabled"].is_boolean()) {
+        bad_request(response, "enabled must be a boolean");
+        return;
+      }
+      if (has_require_accept && !input_tree["require_accept"].is_boolean()) {
+        bad_request(response, "require_accept must be a boolean");
+        return;
+      }
+
+      bool status = true;
+      if (has_enabled) {
+        const bool enabled = input_tree["enabled"].get<bool>();
+        status = nvhttp::set_client_enabled(uuid, enabled) && status;
+        if (!enabled && status) {
+          auto cert = nvhttp::get_cert_by_uuid(uuid);
+          if (!cert.empty()) {
+            rtsp_stream::terminate_sessions_by_cert(cert);
+          }
+
+          if (rtsp_stream::session_count() == 0 && proc::proc.running() > 0) {
+            proc::proc.terminate();
+          }
+        }
+      }
+      if (has_require_accept) {
+        const bool require_accept = input_tree["require_accept"].get<bool>();
+        status = nvhttp::set_client_require_accept(uuid, require_accept) && status;
+      }
+
+      nlohmann::json output_tree;
+      output_tree["status"] = status;
       send_response(response, output_tree);
     } catch (nlohmann::json::exception &e) {
       BOOST_LOG(warning) << "Update Client: "sv << e.what();
+      bad_request(response, e.what());
+    }
+  }
+
+  /**
+   * @brief List paired-client reconnect requests waiting for operator approval.
+   *
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   *
+   * @api_examples{/api/clients/reconnect|:| GET|:| null}
+   */
+  void getPendingReconnects(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+    output_tree["status"] = true;
+    output_tree["reconnects"] = nlohmann::json::array();
+    for (const auto &reconnect : nvhttp::get_pending_reconnects()) {
+      output_tree["reconnects"].push_back({
+        {"id", reconnect.id},
+        {"uuid", reconnect.uuid},
+        {"name", reconnect.name},
+        {"address", reconnect.address},
+        {"action", reconnect.action},
+      });
+    }
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Approve or deny a pending paired-client reconnect request.
+   *
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   * The body for the POST request should be JSON serialized in the following format:
+   * @code{.json}
+   * {
+   *   "request_id": "0123456789abcdef0123456789abcdef",
+   *   "approve": true
+   * }
+   * @endcode
+   *
+   * @api_examples{/api/clients/reconnect|:| POST|:| {"request_id":"0123456789abcdef0123456789abcdef","approve":true}}
+   */
+  void resolvePendingReconnect(const resp_https_t &response, const req_https_t &request) {
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    const std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    std::stringstream ss;
+    ss << request->content.rdbuf();
+    try {
+      const nlohmann::json input_tree = nlohmann::json::parse(ss);
+      if (!input_tree.is_object()) {
+        bad_request(response, "Request body must be a JSON object");
+        return;
+      }
+
+      const std::string request_id = input_tree.contains("request_id") && input_tree["request_id"].is_string() ?
+                                       input_tree["request_id"].get<std::string>() :
+                                       std::string {};
+      if (!nvhttp::is_valid_pairing_id(request_id)) {
+        bad_request(response, "request_id must contain exactly 32 hexadecimal characters");
+        return;
+      }
+      if (!input_tree.contains("approve") || !input_tree["approve"].is_boolean()) {
+        bad_request(response, "approve must be a boolean");
+        return;
+      }
+
+      nlohmann::json output_tree;
+      output_tree["status"] = nvhttp::resolve_pending_reconnect(request_id, input_tree["approve"].get<bool>());
+      send_response(response, output_tree);
+    } catch (const nlohmann::json::exception &e) {
+      BOOST_LOG(warning) << "ResolvePendingReconnect: "sv << e.what();
       bad_request(response, e.what());
     }
   }
@@ -2584,6 +2707,8 @@ namespace confighttp {
     server.resource["^/api/apps/([0-9]+)$"]["DELETE"] = deleteApp;
     server.resource["^/api/apps/close$"]["POST"] = closeApp;
     server.resource["^/api/clients/list$"]["GET"] = getClients;
+    server.resource["^/api/clients/reconnect$"]["GET"] = getPendingReconnects;
+    server.resource["^/api/clients/reconnect$"]["POST"] = resolvePendingReconnect;
     server.resource["^/api/clients/unpair$"]["POST"] = unpair;
     server.resource["^/api/clients/unpair-all$"]["POST"] = unpairAll;
     server.resource["^/api/clients/update$"]["POST"] = updateClient;

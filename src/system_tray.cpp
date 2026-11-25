@@ -119,6 +119,16 @@ namespace system_tray {
       return worker;
     }
 
+    /**
+     * @brief Access persistent storage for the paired-client reconnect approval notification body.
+     *
+     * @return Persistent string backing `tray.notification_text`.
+     */
+    std::string &reconnect_notification_text_storage() {
+      static std::string notification_text;
+      return notification_text;
+    }
+
   #if defined(_WIN32) || defined(__APPLE__)
     /**
      * @brief Access storage for dynamic Virtual HID Broker license menu labels.
@@ -347,6 +357,7 @@ namespace system_tray {
     tray.notification_text = nullptr;
     tray.notification_title = nullptr;
     tray.notification_cb = nullptr;
+    reconnect_notification_text_storage().clear();
     #if defined(_WIN32) || defined(__APPLE__)
     virtualhid_license_menu_text_storage() = {};
     virtualhid_driver_notification_text_storage().clear();
@@ -932,6 +943,31 @@ namespace system_tray {
     tray.tooltip = PROJECT_NAME;
     tray.notification_cb = []() {
       launch_ui("/pin");
+    };
+    tray_update(&tray);
+  }
+
+  void update_tray_require_reconnect(const std::string_view client_name) {
+    const std::scoped_lock lock(tray_state_mutex());
+    if (!tray_initialized_state().load()) {
+      return;
+    }
+
+    tray.notification_title = nullptr;
+    tray.notification_text = nullptr;
+    tray.notification_cb = nullptr;
+    tray.notification_icon = nullptr;
+    tray_update(&tray);
+
+    auto &notification_text = reconnect_notification_text_storage();
+    notification_text = client_name.empty() ?
+                          "An unknown device is requesting to reconnect. Click here to review." :
+                          std::format("{} is requesting to reconnect. Click here to review.", client_name);
+    tray.notification_title = "Incoming Connection Request";
+    tray.notification_text = notification_text.c_str();
+    tray.notification_icon = tray.allIconPaths[1];
+    tray.notification_cb = []() {
+      launch_ui("/troubleshooting#unpair");
     };
     tray_update(&tray);
   }
