@@ -1428,6 +1428,16 @@ namespace confighttp {
     send_response(response, output_tree);
   }
 
+  std::optional<bool> client_enable_based_on_payload(nlohmann::json input_tree) {
+    if (input_tree.contains("enabled")) {
+      return input_tree["enabled"].get<bool>();
+    } else if (input_tree.contains("uuid") && input_tree.size() == 1) {
+      // Legecy behavior: assumes enabled=true if only a uuid is provided.
+      return true;
+    }
+    return std::nullopt;
+  }
+
   /**
    * @brief Update per-device settings for a paired client.
    * @param response The HTTP response object.
@@ -1474,10 +1484,6 @@ namespace confighttp {
 
       const bool has_enabled = input_tree.contains("enabled");
       const bool has_require_accept = input_tree.contains("require_accept");
-      if (!has_enabled && !has_require_accept) {
-        bad_request(response, "At least one client setting must be provided");
-        return;
-      }
       if (has_enabled && !input_tree["enabled"].is_boolean()) {
         bad_request(response, "enabled must be a boolean");
         return;
@@ -1487,11 +1493,13 @@ namespace confighttp {
         return;
       }
 
-      bool status = true;
-      if (has_enabled) {
-        const bool enabled = input_tree["enabled"].get<bool>();
-        status = nvhttp::set_client_enabled(uuid, enabled) && status;
-        if (!enabled && status) {
+      bool status = false;
+
+      auto enabled = client_enable_based_on_payload(input_tree);
+      if (enabled.has_value()) {
+        bool enabled_changed = nvhttp::set_client_enabled(uuid, enabled.value());
+        status = status || enabled_changed;
+        if (!enabled.value() && enabled_changed) {
           auto cert = nvhttp::get_cert_by_uuid(uuid);
           if (!cert.empty()) {
             rtsp_stream::terminate_sessions_by_cert(cert);
@@ -1502,9 +1510,10 @@ namespace confighttp {
           }
         }
       }
+
       if (has_require_accept) {
         const bool require_accept = input_tree["require_accept"].get<bool>();
-        status = nvhttp::set_client_require_accept(uuid, require_accept) && status;
+        status = nvhttp::set_client_require_accept(uuid, require_accept) || status;
       }
 
       nlohmann::json output_tree;

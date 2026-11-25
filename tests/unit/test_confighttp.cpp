@@ -822,12 +822,11 @@ TEST_F(ConfigHttpTest, ClientUpdateRestApiUpdatesEnabledAndRequireAcceptFlagsAnd
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Content-Type", "application/json");
 
-  const std::array<std::string, 6> invalid_payloads {
+  const std::array<std::string, 5> invalid_payloads {
     "not-json",
     R"([])",
     R"({"enabled":true})",
     R"({"uuid":"","enabled":true})",
-    std::format(R"({{"uuid":"{}"}})", uuid),
     std::format(R"({{"uuid":"{}","require_accept":"yes"}})", uuid),
   };
   for (const auto &payload : invalid_payloads) {
@@ -873,6 +872,23 @@ TEST_F(ConfigHttpTest, ClientUpdateRestApiUpdatesEnabledAndRequireAcceptFlagsAnd
   ASSERT_EQ(updated_list.size(), 1);
   EXPECT_FALSE(updated_list.front().at("enabled").get<bool>());
   EXPECT_FALSE(updated_list.front().at("require_accept").get<bool>());
+
+  // Legacy quirk: If only uuid is passed then `enabled` is assumed true
+  const auto default_enable = client->request(
+    "POST",
+    "/clients-update-test",
+    nlohmann::json {{"uuid", uuid}}.dump(),
+    headers
+  );
+  ASSERT_EQ(default_enable->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(default_enable->content.string()).at("status").get<bool>());
+
+  const auto reenabled_list = nlohmann::json::parse(
+                                client->request("GET", "/clients-list-test", "", get_headers)->content.string()
+  )
+                                .at("named_certs");
+  ASSERT_EQ(reenabled_list.size(), 1);
+  EXPECT_TRUE(reenabled_list.front().at("enabled").get<bool>());
 }
 
 TEST_F(ConfigHttpTest, ClientReconnectRestApiListsValidatesAndResolvesPendingRequests) {
