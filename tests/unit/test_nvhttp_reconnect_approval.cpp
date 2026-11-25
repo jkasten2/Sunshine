@@ -254,13 +254,13 @@ TEST_F(ReconnectApprovalTest, ReconnectQueueLifecycleSupersedesExpiresBoundsAndC
 
   std::vector<std::string> bounded_uuids;
   for (std::size_t index = 0; index < nvhttp::MAX_PENDING_RECONNECT_REQUESTS; ++index) {
-    const auto creds = test_utils::certificates::generate_ca_credentials(std::format("Bounded {}", index));
+    const auto creds = crypto::gen_creds(std::format("Bounded {}", index), 1024);
     const auto uuid = nvhttp::test_support::add_client(std::format("Client {}", index), creds.x509, true);
     ASSERT_FALSE(uuid.empty());
     bounded_uuids.push_back(uuid);
     EXPECT_FALSE(nvhttp::test_support::enqueue_reconnect_for_testing(uuid, "192.0.2.20", "launch").empty());
   }
-  const auto overflow_creds = test_utils::certificates::generate_ca_credentials("Overflow Client");
+  const auto overflow_creds = crypto::gen_creds("Overflow Client", 1024);
   const auto overflow_uuid = nvhttp::test_support::add_client("Overflow", overflow_creds.x509, true);
   ASSERT_FALSE(overflow_uuid.empty());
   EXPECT_TRUE(nvhttp::test_support::enqueue_reconnect_for_testing(overflow_uuid, "192.0.2.99", "launch").empty());

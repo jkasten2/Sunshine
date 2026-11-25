@@ -76,7 +76,7 @@ namespace nvhttp {
   /**
    * @brief Maximum number of pending reconnect approval requests retained at one time.
    */
-  constexpr std::size_t MAX_PENDING_RECONNECT_REQUESTS = 32;
+  constexpr std::size_t MAX_PENDING_RECONNECT_REQUESTS = 8;
 
   /**
    * @brief Lifetime of a held reconnect approval request before it times out.
