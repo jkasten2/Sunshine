@@ -104,15 +104,16 @@ namespace {
       server = nvhttp::test_support::make_stream_https_server(server_cert_file.string(), server_key_file.string(), host_audio);
       server->config.address = "127.0.0.1";
       server->config.port = 0;
-      server_thread = std::jthread([this]() {
-        server->start([this](const unsigned short assigned_port) {
-          port = assigned_port;
+      std::promise<unsigned short> port_promise;
+      auto port_future = port_promise.get_future();
+      server_thread = std::jthread([this, port_promise = std::move(port_promise)]() mutable {
+        server->start([&port_promise](const unsigned short assigned_port) {
+          port_promise.set_value(assigned_port);
         });
       });
 
-      for (int attempt = 0; attempt < 200 && port == 0; ++attempt) {
-        std::this_thread::sleep_for(10ms);
-      }
+      EXPECT_EQ(port_future.wait_for(2s), std::future_status::ready);
+      port = port_future.get();
       EXPECT_NE(port, 0);
     }
 
@@ -282,20 +283,9 @@ TEST_F(ReconnectApprovalTest, HttpsStreamServerHoldsAndResolvesReconnectRequests
   const std::string launch_path =
     "/launch?appid=0&rikey=00112233445566778899aabbccddeeff&rikeyid=1&localAudioPlayMode=0";
 
-  auto wait_for_pending_id = [&](const std::string_view previous_id = {}) {
-    for (int attempt = 0; attempt < 200; ++attempt) {
-      const auto pending = nvhttp::get_pending_reconnects();
-      if (!pending.empty() && pending.front().id != previous_id) {
-        return pending.front().id;
-      }
-      std::this_thread::sleep_for(10ms);
-    }
-    return std::string {};
-  };
-
   // Deny flow holds `/launch` until operator rejects it with 403.
   auto denied_future = https_server.async_get(launch_path);
-  const auto denied_id = wait_for_pending_id();
+  const auto denied_id = nvhttp::test_support::wait_for_pending_reconnect_id();
   ASSERT_FALSE(denied_id.empty());
   EXPECT_EQ(denied_future.wait_for(50ms), std::future_status::timeout);
   ASSERT_TRUE(nvhttp::resolve_pending_reconnect(denied_id, false));
@@ -305,11 +295,11 @@ TEST_F(ReconnectApprovalTest, HttpsStreamServerHoldsAndResolvesReconnectRequests
 
   // Supersede flow rejects the earlier held request with 409 and keeps the newer one pending.
   auto first_future = https_server.async_get(launch_path);
-  const auto first_id = wait_for_pending_id();
+  const auto first_id = nvhttp::test_support::wait_for_pending_reconnect_id();
   ASSERT_FALSE(first_id.empty());
 
   auto second_future = https_server.async_get(launch_path);
-  const auto second_id = wait_for_pending_id(first_id);
+  const auto second_id = nvhttp::test_support::wait_for_pending_reconnect_id(first_id);
   ASSERT_FALSE(second_id.empty());
   EXPECT_NE(first_id, second_id);
 

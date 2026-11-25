@@ -545,6 +545,18 @@ namespace nvhttp {
       const std::string &private_key_file,
       bool &host_audio
     );
+
+    /**
+     * @brief Block until a pending reconnect request with an ID different from `previous_id` is queued.
+     *
+     * @param previous_id Previously observed request ID to skip, or empty for any pending request.
+     * @param timeout Maximum duration to wait.
+     * @return Queued request ID, or an empty string on timeout.
+     */
+    std::string wait_for_pending_reconnect_id(
+      std::string_view previous_id = {},
+      std::chrono::milliseconds timeout = std::chrono::seconds {2}
+    );
   }  // namespace test_support
 #endif
 }  // namespace nvhttp

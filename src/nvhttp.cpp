@@ -1396,6 +1396,16 @@ namespace nvhttp {
     }
 
     /**
+     * @brief Access the condition variable notified when pending reconnect requests change.
+     *
+     * @return Condition variable signaled after queueing a new reconnect request.
+     */
+    std::condition_variable &reconnect_condition() {
+      static std::condition_variable cv;
+      return cv;
+    }
+
+    /**
      * @brief Access in-memory storage of pending reconnect approval requests.
      *
      * @return Vector of pending reconnect entries in insertion order.
@@ -1690,6 +1700,9 @@ namespace nvhttp {
       complete_expired_reconnects(expired);
       if (superseded) {
         write_reconnect_failure_response(*superseded, 409, "Superseded by a newer connection request");
+      }
+      if (queued) {
+        reconnect_condition().notify_all();
       }
       return queued;
     }
@@ -2752,6 +2765,23 @@ namespace nvhttp {
       };
       server->resource["^/cancel$"]["GET"] = cancel;
       return server;
+    }
+
+    std::string wait_for_pending_reconnect_id(
+      const std::string_view previous_id,
+      const std::chrono::milliseconds timeout
+    ) {
+      std::unique_lock lock {reconnect_mutex()};
+      std::string matched_id;
+      reconnect_condition().wait_for(lock, timeout, [&]() {
+        const auto &entries = pending_reconnect_entries();
+        if (!entries.empty() && entries.front().id != previous_id) {
+          matched_id = entries.front().id;
+          return true;
+        }
+        return false;
+      });
+      return matched_id;
     }
   }  // namespace test_support
 #endif
