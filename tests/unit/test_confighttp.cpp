@@ -822,20 +822,15 @@ TEST_F(ConfigHttpTest, ClientUpdateRestApiUpdatesEnabledAndRequireAcceptFlagsAnd
   headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
   headers.emplace("Content-Type", "application/json");
 
-  const std::array<std::string, 5> invalid_payloads {
-    "not-json",
-    R"([])",
-    R"({"enabled":true})",
-    R"({"uuid":"","enabled":true})",
-    std::format(R"({{"uuid":"{}","require_accept":"yes"}})", uuid),
-  };
-  for (const auto &payload : invalid_payloads) {
+  auto expect_bad_update = [&](const std::string &payload) {
     EXPECT_EQ(client->request("POST", "/clients-update-test", payload, headers)->status_code, "400 Bad Request");
-  }
-  EXPECT_EQ(
-    client->request("POST", "/clients-update-test", std::format(R"({{"uuid":"{}","enabled":"no"}})", uuid), headers)->status_code,
-    "400 Bad Request"
-  );
+  };
+  expect_bad_update("not-json");
+  expect_bad_update(R"([])");
+  expect_bad_update(R"({"enabled":true})");
+  expect_bad_update(R"({"uuid":"","enabled":true})");
+  expect_bad_update(std::format(R"({{"uuid":"{}","require_accept":"yes"}})", uuid));
+  expect_bad_update(std::format(R"({{"uuid":"{}","enabled":"no"}})", uuid));
 
   const auto enable_require = client->request(
     "POST",
