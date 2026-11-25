@@ -2239,6 +2239,21 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
+    const auto client_cert = find_verified_request_cert(request);
+    const auto client_record = find_client_by_cert(client_cert);
+    if (client_record && !client_record->enabled) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client is disabled");
+      return;
+    }
+    if (client_record && client_record->require_accept) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client is not permitted to cancel the session");
+      return;
+    }
+
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
@@ -2735,6 +2750,7 @@ namespace nvhttp {
       server->resource["^/resume$"]["GET"] = [&host_audio, raw_server, post_to_https_server](auto resp, auto req) {
         resume(host_audio, resp, req, raw_server->io_service, post_to_https_server);
       };
+      server->resource["^/cancel$"]["GET"] = cancel;
       return server;
     }
   }  // namespace test_support
