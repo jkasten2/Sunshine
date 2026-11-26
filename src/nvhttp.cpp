@@ -11,8 +11,10 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 // lib includes
@@ -1638,9 +1640,9 @@ namespace nvhttp {
      * @param response Held HTTPS response object.
      * @param io_service Optional HTTPS server I/O context used to arm an automatic expiration timer.
      * @param on_approve Continuation executed if the operator approves the request.
-     * @return `true` when queued; `false` when the bounded pending queue is full.
+     * @return Generated request UUID when queued, or an empty string when the bounded pending queue is full.
      */
-    bool enqueue_reconnect_approval(
+    std::string enqueue_reconnect_approval(
       const named_cert_t &client,
       std::string address,
       std::string action,
@@ -1650,7 +1652,7 @@ namespace nvhttp {
     ) {
       std::vector<pending_reconnect_entry_t> expired;
       std::optional<pending_reconnect_entry_t> superseded;
-      bool queued = false;
+      std::string queued_id;
       {
         std::lock_guard lock {reconnect_mutex()};
         const auto now = std::chrono::steady_clock::now();
@@ -1685,8 +1687,8 @@ namespace nvhttp {
             });
           }
 
+          queued_id = entry.id;
           entries.push_back(std::move(entry));
-          queued = true;
         }
       }
 
@@ -1694,10 +1696,10 @@ namespace nvhttp {
       if (superseded) {
         write_reconnect_failure_response(*superseded, 409, "Superseded by a newer connection request");
       }
-      if (queued) {
+      if (!queued_id.empty()) {
         reconnect_condition().notify_all();
       }
-      return queued;
+      return queued_id;
     }
   }  // namespace
 
@@ -1925,20 +1927,102 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Validated `/launch` or `/resume` request context shared across immediate and deferred execution.
+   */
+  struct stream_request_t {
+    std::string_view action;  ///< GameStream action name (`"launch"` or `"resume"`).
+    std::string_view xml_result_key;  ///< XML element key cleared on failure (`"root.gamesession"` or `"root.resume"`).
+    bool &host_audio;  ///< Mutable host-audio state updated on execution.
+    resp_https_t response;  ///< HTTPS response object to hold or complete.
+    req_https_t request;  ///< HTTPS request from the Moonlight client.
+    args_t args;  ///< Parsed request query parameters.
+    https_server_t *server = nullptr;  ///< Optional owning HTTPS server used for timers and guarded dispatch.
+    void (*execute)(bool &, resp_https_t, req_https_t, const args_t &, const std::string &, const std::string &);  ///< Execution handler.
+  };
+
+  /**
+   * @brief Build the approval callback that executes a held stream request on the HTTPS server thread.
+   *
+   * @param req Held stream request context (with `response` already moved to the pending queue).
+   * @param client_cert Verified PEM certificate of the connecting client.
+   * @param client_name Friendly name of the connecting client.
+   * @return Callback invoked upon operator approval.
+   */
+  std::function<void(resp_https_t)> make_stream_approval_callback(
+    stream_request_t req,
+    std::string client_cert,
+    std::string client_name
+  ) {
+    auto state = std::make_shared<stream_request_t>(std::move(req));
+    return [state = std::move(state), cert = std::move(client_cert), name = std::move(client_name)](resp_https_t response) mutable {
+      auto *server = state->server;
+      auto work = [state = std::move(state), response = std::move(response), cert = std::move(cert), name = std::move(name)]() mutable {
+        state->execute(state->host_audio, std::move(response), std::move(state->request), state->args, cert, name);
+      };
+      if (server) {
+        server->post_guarded(std::move(work));
+      } else {
+        work();
+      }
+    };
+  }
+
+  /**
+   * @brief Authorize, hold for reconnect approval if required, or immediately execute a `/launch` or `/resume` request.
+   *
+   * @param req Validated stream request context.
+   * @param tree XML property tree populated on immediate 403/503 failure.
+   * @return `true` when the response was held or handled by `req.execute`; `false` when `tree` holds an error response.
+   */
+  bool dispatch_or_hold_stream_request(stream_request_t req, pt::ptree &tree) {
+    const auto client_cert = find_verified_request_cert(req.request);
+    const auto client_record = find_client_by_cert(client_cert);
+    if (client_record && !client_record->enabled) {
+      tree.put(std::string {req.xml_result_key}, 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client is disabled");
+      return false;
+    }
+
+    const std::string client_name = client_record ? client_record->name : last_verified_client_name;
+    if (!client_record || !client_record->require_accept) {
+      req.execute(req.host_audio, std::move(req.response), std::move(req.request), req.args, client_cert, client_name);
+      return true;
+    }
+
+    auto address = net::addr_to_normalized_string(req.request->remote_endpoint().address());
+    auto action = std::string {req.action};
+    const auto xml_result_key = req.xml_result_key;
+    auto response = std::move(req.response);
+    auto io_service = req.server ? req.server->io_service : nullptr;
+    auto on_approve = make_stream_approval_callback(std::move(req), client_cert, client_name);
+
+    if (enqueue_reconnect_approval(*client_record, std::move(address), std::move(action), std::move(response), io_service, std::move(on_approve)).empty()) {
+      tree.put(std::string {xml_result_key}, 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Too many pending connection approval requests");
+      return false;
+    }
+
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+    system_tray::update_tray_require_reconnect(client_record->name);
+#endif
+    return true;
+  }
+
+  /**
    * @brief Launch the requested application for a GameStream session, holding for approval when configured.
    *
    * @param host_audio Host audio.
    * @param response HTTP response object to populate or hold.
    * @param request HTTP request data from the client.
-   * @param io_service Optional HTTPS server I/O context for expiration timers.
-   * @param post_to_server Optional scheduler that posts approved continuations back onto the HTTPS server thread.
+   * @param server Optional owning HTTPS server used for expiration timers and guarded continuations.
    */
   void launch(
     bool &host_audio,
     resp_https_t response,
     req_https_t request,
-    const std::shared_ptr<boost::asio::io_context> &io_service = nullptr,
-    const std::function<void(std::function<void()>)> &post_to_server = {}
+    https_server_t *server = nullptr
   ) {
     print_req<SunshineHTTPS>(request);
 
@@ -1977,56 +2061,21 @@ namespace nvhttp {
       return;
     }
 
-    const auto client_cert = find_verified_request_cert(request);
-    const auto client_record = find_client_by_cert(client_cert);
-    if (client_record && !client_record->enabled) {
-      tree.put("root.gamesession", 0);
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Client is disabled");
-      return;
-    }
-
-    const std::string client_name = client_record ? client_record->name : last_verified_client_name;
-    if (client_record && client_record->require_accept) {
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-      const bool queued = enqueue_reconnect_approval(
-        *client_record,
-        std::move(address),
-        "launch"s,
-        response,
-        io_service,
-        [&host_audio, request, args = std::move(args), client_cert, client_name, post_to_server](resp_https_t approved_response) mutable {
-          auto work = [&host_audio,
-                       approved_response = std::move(approved_response),
-                       request = std::move(request),
-                       args = std::move(args),
-                       client_cert = std::move(client_cert),
-                       client_name = std::move(client_name)]() mutable {
-            execute_launch_approved(host_audio, std::move(approved_response), std::move(request), args, client_cert, client_name);
-          };
-          if (post_to_server) {
-            post_to_server(std::move(work));
-          } else {
-            work();
-          }
-        }
-      );
-      if (!queued) {
-        tree.put("root.gamesession", 0);
-        tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Too many pending connection approval requests");
-        return;
-      }
-
+    if (dispatch_or_hold_stream_request(
+          {
+            .action = "launch"sv,
+            .xml_result_key = "root.gamesession"sv,
+            .host_audio = host_audio,
+            .response = std::move(response),
+            .request = std::move(request),
+            .args = std::move(args),
+            .server = server,
+            .execute = execute_launch_approved,
+          },
+          tree
+        )) {
       g.disable();
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-      system_tray::update_tray_require_reconnect(client_record->name);
-#endif
-      return;
     }
-
-    g.disable();
-    execute_launch_approved(host_audio, std::move(response), std::move(request), args, client_cert, client_name);
   }
 
   /**
@@ -2129,15 +2178,13 @@ namespace nvhttp {
    * @param host_audio Host audio.
    * @param response HTTP response object to populate or hold.
    * @param request HTTP request data from the client.
-   * @param io_service Optional HTTPS server I/O context for expiration timers.
-   * @param post_to_server Optional scheduler that posts approved continuations back onto the HTTPS server thread.
+   * @param server Optional owning HTTPS server used for expiration timers and guarded continuations.
    */
   void resume(
     bool &host_audio,
     resp_https_t response,
     req_https_t request,
-    const std::shared_ptr<boost::asio::io_context> &io_service = nullptr,
-    const std::function<void(std::function<void()>)> &post_to_server = {}
+    https_server_t *server = nullptr
   ) {
     print_req<SunshineHTTPS>(request);
 
@@ -2175,56 +2222,21 @@ namespace nvhttp {
       return;
     }
 
-    const auto client_cert = find_verified_request_cert(request);
-    const auto client_record = find_client_by_cert(client_cert);
-    if (client_record && !client_record->enabled) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Client is disabled");
-      return;
-    }
-
-    const std::string client_name = client_record ? client_record->name : last_verified_client_name;
-    if (client_record && client_record->require_accept) {
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-      const bool queued = enqueue_reconnect_approval(
-        *client_record,
-        std::move(address),
-        "resume"s,
-        response,
-        io_service,
-        [&host_audio, request, args = std::move(args), client_cert, client_name, post_to_server](resp_https_t approved_response) mutable {
-          auto work = [&host_audio,
-                       approved_response = std::move(approved_response),
-                       request = std::move(request),
-                       args = std::move(args),
-                       client_cert = std::move(client_cert),
-                       client_name = std::move(client_name)]() mutable {
-            execute_resume_approved(host_audio, std::move(approved_response), std::move(request), args, client_cert, client_name);
-          };
-          if (post_to_server) {
-            post_to_server(std::move(work));
-          } else {
-            work();
-          }
-        }
-      );
-      if (!queued) {
-        tree.put("root.resume", 0);
-        tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Too many pending connection approval requests");
-        return;
-      }
-
+    if (dispatch_or_hold_stream_request(
+          {
+            .action = "resume"sv,
+            .xml_result_key = "root.resume"sv,
+            .host_audio = host_audio,
+            .response = std::move(response),
+            .request = std::move(request),
+            .args = std::move(args),
+            .server = server,
+            .execute = execute_resume_approved,
+          },
+          tree
+        )) {
       g.disable();
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-      system_tray::update_tray_require_reconnect(client_record->name);
-#endif
-      return;
     }
-
-    g.disable();
-    execute_resume_approved(host_audio, std::move(response), std::move(request), args, client_cert, client_name);
   }
 
   /**
@@ -2306,40 +2318,31 @@ namespace nvhttp {
    */
   std::pair<bool, std::string> get_client_status(const std::string_view cert_pem);
 
-  void start() {
-    platf::set_thread_name("nvhttp");
-    auto shutdown_event = mail::man->event<bool>(mail::shutdown);
+  /**
+   * @brief Extract the peer X.509 certificate from an OpenSSL session handle.
+   *
+   * @param ssl Active OpenSSL session.
+   * @return Owned X.509 peer certificate, or null when absent.
+   */
+  crypto::x509_t get_peer_certificate(SSL *ssl) {
+    return crypto::x509_t {
+#if OPENSSL_VERSION_MAJOR >= 3
+      SSL_get1_peer_certificate(ssl)
+#else
+      SSL_get_peer_certificate(ssl)
+#endif
+    };
+  }
 
-    auto port_http = net::map_port(PORT_HTTP);
-    auto port_https = net::map_port(PORT_HTTPS);
-    auto address_family = net::af_from_enum_string(config::sunshine.address_family);
-
-    bool clean_slate = config::sunshine.flags[config::flag::FRESH_STATE];
-
-    if (!clean_slate) {
-      load_state();
-    }
-
-    auto pkey = file_handler::read_file(config::nvhttp.pkey.c_str());
-    auto cert = file_handler::read_file(config::nvhttp.cert.c_str());
-    setup(pkey, cert);
-
-    // resume doesn't always get the parameter "localAudioPlayMode"
-    // launch will store it in host_audio
-    bool host_audio {};
-
-    https_server_t https_server {config::nvhttp.cert, config::nvhttp.pkey};
-    http_server_t http_server;
-
+  /**
+   * @brief Configure TLS client-certificate verification callbacks on an HTTPS server.
+   *
+   * @param https_server HTTPS server instance to configure.
+   */
+  void configure_https_verification(https_server_t &https_server) {
     // Verify certificates after establishing connection
     https_server.verify = [](SSL *ssl) {
-      crypto::x509_t x509 {
-#if OPENSSL_VERSION_MAJOR >= 3
-        SSL_get1_peer_certificate(ssl)
-#else
-        SSL_get_peer_certificate(ssl)
-#endif
-      };
+      auto x509 = get_peer_certificate(ssl);
       if (!x509) {
         BOOST_LOG(info) << "unknown -- denied"sv;
         return 0;
@@ -2379,14 +2382,7 @@ namespace nvhttp {
     };
 
     https_server.on_verified = [](const req_https_t &request, SSL *ssl) {
-      crypto::x509_t x509 {
-#if OPENSSL_VERSION_MAJOR >= 3
-        SSL_get1_peer_certificate(ssl)
-#else
-        SSL_get_peer_certificate(ssl)
-#endif
-      };
-      if (x509) {
+      if (auto x509 = get_peer_certificate(ssl)) {
         store_verified_request_cert(request, crypto::pem(x509));
       }
     };
@@ -2405,10 +2401,95 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.query"s, req->path);
       tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
     };
+  }
 
-    auto post_to_https_server = [&https_server](std::function<void()> callback) {
-      https_server.post_guarded(std::move(callback));
+  /**
+   * @brief Runtime bind, TLS, and lifecycle options for @ref nvhttp::start.
+   */
+  struct server_options_t {
+    std::string address;  ///< Bind address for HTTP and HTTPS listeners.
+    std::uint16_t port_http = 0;  ///< HTTP listener port (`0` selects an ephemeral port).
+    std::uint16_t port_https = 0;  ///< HTTPS listener port (`0` selects an ephemeral port).
+    std::string cert_file;  ///< Path to the server certificate PEM file.
+    std::string pkey_file;  ///< Path to the server private key PEM file.
+    bool load_persisted_state = true;  ///< Whether to load paired-client state from disk on startup.
+    std::shared_ptr<safe::event_t<bool>> shutdown_event;  ///< Shutdown signal stopping both listeners.
+    std::function<void(unsigned short)> on_https_started;  ///< Optional callback receiving the bound HTTPS port.
+    std::function<void(unsigned short)> on_http_started;  ///< Optional callback receiving the bound HTTP port.
+  };
+
+#ifdef SUNSHINE_TESTS
+  thread_local std::optional<server_options_t> test_server_options;  ///< Thread-local startup override for loopback tests.
+
+  /**
+   * @brief RAII scope that installs and clears @ref test_server_options on the calling thread.
+   */
+  struct scoped_test_server_options_t {
+    /**
+     * @brief Install startup options for the next @ref nvhttp::start call on this thread.
+     *
+     * @param options Startup configuration to consume.
+     */
+    explicit scoped_test_server_options_t(server_options_t options) {
+      test_server_options = std::move(options);
+    }
+
+    /**
+     * @brief Clear any unconsumed startup options when the scope exits.
+     */
+    ~scoped_test_server_options_t() {
+      test_server_options.reset();
+    }
+  };
+#endif
+
+  /**
+   * @brief Resolve runtime bind, TLS, and shutdown options for @ref nvhttp::start.
+   *
+   * @return Startup options from global config, or the thread-local test override when set.
+   */
+  server_options_t resolve_server_options() {
+#ifdef SUNSHINE_TESTS
+    if (test_server_options) {
+      auto options = std::move(*test_server_options);
+      test_server_options.reset();
+      return options;
+    }
+#endif
+    const auto address_family = net::af_from_enum_string(config::sunshine.address_family);
+    return {
+      .address = net::get_bind_address(address_family),
+      .port_http = net::map_port(PORT_HTTP),
+      .port_https = net::map_port(PORT_HTTPS),
+      .cert_file = config::nvhttp.cert,
+      .pkey_file = config::nvhttp.pkey,
+      .load_persisted_state = !config::sunshine.flags[config::flag::FRESH_STATE],
+      .shutdown_event = mail::man->event<bool>(mail::shutdown),
+      .on_https_started = {},
+      .on_http_started = {},
     };
+  }
+
+  void start() {
+    platf::set_thread_name("nvhttp");
+    const auto options = resolve_server_options();
+
+    if (options.load_persisted_state) {
+      load_state();
+    }
+
+    auto pkey = file_handler::read_file(options.pkey_file.c_str());
+    auto cert = file_handler::read_file(options.cert_file.c_str());
+    setup(pkey, cert);
+
+    // resume doesn't always get the parameter "localAudioPlayMode"
+    // launch will store it in host_audio
+    bool host_audio {};
+
+    https_server_t https_server {options.cert_file, options.pkey_file};
+    http_server_t http_server;
+
+    configure_https_verification(https_server);
 
     https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
     https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SunshineHTTPS>;
@@ -2417,17 +2498,17 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
-    https_server.resource["^/launch$"]["GET"] = [&host_audio, &https_server, post_to_https_server](auto resp, auto req) {
-      launch(host_audio, resp, req, https_server.io_service, post_to_https_server);
+    https_server.resource["^/launch$"]["GET"] = [&host_audio, &https_server](auto resp, auto req) {
+      launch(host_audio, std::move(resp), std::move(req), &https_server);
     };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio, &https_server, post_to_https_server](auto resp, auto req) {
-      resume(host_audio, resp, req, https_server.io_service, post_to_https_server);
+    https_server.resource["^/resume$"]["GET"] = [&host_audio, &https_server](auto resp, auto req) {
+      resume(host_audio, std::move(resp), std::move(req), &https_server);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
 
     https_server.config.reuse_address = true;
-    https_server.config.address = net::get_bind_address(address_family);
-    https_server.config.port = port_https;
+    https_server.config.address = options.address;
+    https_server.config.port = options.port_https;
 
     http_server.default_resource["GET"] = not_found<SimpleWeb::HTTP>;
     http_server.resource["^/serverinfo$"]["GET"] = serverinfo<SimpleWeb::HTTP>;
@@ -2436,30 +2517,30 @@ namespace nvhttp {
     };
 
     http_server.config.reuse_address = true;
-    http_server.config.address = net::get_bind_address(address_family);
-    http_server.config.port = port_http;
+    http_server.config.address = options.address;
+    http_server.config.port = options.port_http;
 
-    auto accept_and_run = [&](auto *web_server) {
+    auto accept_and_run = [&](auto *web_server, std::function<void(unsigned short)> on_started) {
       try {
         std::string name = "nvhttp::" + std::to_string(web_server->config.port);
         platf::set_thread_name(name);
-        web_server->start();
+        web_server->start(std::move(on_started));
       } catch (boost::system::system_error &err) {
         // It's possible the exception gets thrown after calling http_server->stop() from a different thread
-        if (shutdown_event->peek()) {
+        if (options.shutdown_event->peek()) {
           return;
         }
 
-        BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << port_https << ", "sv << port_https << "]: "sv << err.what();
-        shutdown_event->raise(true);
+        BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv << options.port_http << ", "sv << options.port_https << "]: "sv << err.what();
+        options.shutdown_event->raise(true);
         return;
       }
     };
-    std::jthread ssl {accept_and_run, &https_server};
-    std::jthread tcp {accept_and_run, &http_server};
+    std::jthread ssl {accept_and_run, &https_server, options.on_https_started};
+    std::jthread tcp {accept_and_run, &http_server, options.on_http_started};
 
     // Wait for any event
-    shutdown_event->view();
+    options.shutdown_event->view();
 
     cancel_all_pending_reconnects();
     https_server.stop();
@@ -2665,7 +2746,7 @@ namespace nvhttp {
         return {};
       }
 
-      const bool queued = enqueue_reconnect_approval(
+      return enqueue_reconnect_approval(
         *client,
         std::move(address),
         std::move(action),
@@ -2677,88 +2758,92 @@ namespace nvhttp {
           }
         }
       );
-      if (!queued) {
-        return {};
-      }
-
-      std::lock_guard lock {reconnect_mutex()};
-      const auto &entries = pending_reconnect_entries();
-      const auto it = std::ranges::find(entries, uuid, &pending_reconnect_entry_t::client_uuid);
-      return it != entries.end() ? it->id : std::string {};
     }
 
-    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_stream_https_server(
-      const std::string &certificate_file,
-      const std::string &private_key_file,
-      bool &host_audio
+    /**
+     * @brief Concrete RAII loopback server running @ref nvhttp::start on a background thread.
+     */
+    class loopback_server_impl_t final: public loopback_server_t {
+    public:
+      /**
+       * @brief Start @ref nvhttp::start on `127.0.0.1` with ephemeral ports and wait until both listeners bind.
+       *
+       * @param certificate_file Path to the server certificate PEM file.
+       * @param private_key_file Path to the matching private key PEM file.
+       */
+      loopback_server_impl_t(std::string certificate_file, std::string private_key_file):
+          shutdown_event {std::make_shared<safe::event_t<bool>>()} {
+        using namespace std::chrono_literals;
+
+        auto https_port_promise = std::make_shared<std::promise<unsigned short>>();
+        auto http_port_promise = std::make_shared<std::promise<unsigned short>>();
+        auto https_port_future = https_port_promise->get_future();
+        auto http_port_future = http_port_promise->get_future();
+
+        server_options_t options {
+          .address = "127.0.0.1"s,
+          .port_http = 0,
+          .port_https = 0,
+          .cert_file = std::move(certificate_file),
+          .pkey_file = std::move(private_key_file),
+          .load_persisted_state = false,
+          .shutdown_event = shutdown_event,
+          .on_https_started = [https_port_promise = std::move(https_port_promise)](const unsigned short port) {
+            https_port_promise->set_value(port);
+          },
+          .on_http_started = [http_port_promise = std::move(http_port_promise)](const unsigned short port) {
+            http_port_promise->set_value(port);
+          },
+        };
+
+        server_thread = std::jthread([options = std::move(options)]() mutable {
+          scoped_test_server_options_t guard {std::move(options)};
+          nvhttp::start();
+        });
+
+        try {
+          if (
+            https_port_future.wait_for(2s) == std::future_status::ready &&
+            http_port_future.wait_for(2s) == std::future_status::ready
+          ) {
+            bound_https_port = https_port_future.get();
+            (void) http_port_future.get();
+          }
+        } catch (const std::future_error &) {
+          bound_https_port = 0;
+        }
+      }
+
+      /**
+       * @brief Signal shutdown and join the @ref nvhttp::start thread.
+       */
+      ~loopback_server_impl_t() override {
+        shutdown_event->raise(true);
+        if (server_thread.joinable()) {
+          server_thread.join();
+        }
+      }
+
+      /**
+       * @brief Return the assigned loopback HTTPS port, or `0` if startup failed.
+       *
+       * @return Bound HTTPS port.
+       */
+      unsigned short https_port() const override {
+        return bound_https_port;
+      }
+
+    private:
+      std::shared_ptr<safe::event_t<bool>> shutdown_event;  ///< Shutdown signal owned by this loopback server.
+      std::jthread server_thread;  ///< Background thread executing `nvhttp::start()`.
+      unsigned short bound_https_port = 0;  ///< Assigned ephemeral HTTPS port.
+    };
+
+    std::unique_ptr<loopback_server_t> start_loopback_server(
+      std::string certificate_file,
+      std::string private_key_file
     ) {
-      auto server = std::make_unique<SunshineHTTPSServer>(certificate_file, private_key_file);
-      auto *raw_server = server.get();
-
-      server->verify = [](SSL *ssl) {
-        crypto::x509_t x509 {
-  #if OPENSSL_VERSION_MAJOR >= 3
-          SSL_get1_peer_certificate(ssl)
-  #else
-          SSL_get_peer_certificate(ssl)
-  #endif
-        };
-        if (!x509) {
-          return 0;
-        }
-
-        std::lock_guard lock {client_auth_mutex()};
-        if (verify_client_certificate(x509.get()) != nullptr) {
-          return 0;
-        }
-
-        auto pem = crypto::pem(x509);
-        auto [enabled, client_name] = get_client_status(pem);
-        if (!enabled) {
-          return 0;
-        }
-
-        last_verified_client_cert = pem;
-        last_verified_client_name = client_name;
-        return 1;
-      };
-
-      server->on_verified = [](const req_https_t &request, SSL *ssl) {
-        crypto::x509_t x509 {
-  #if OPENSSL_VERSION_MAJOR >= 3
-          SSL_get1_peer_certificate(ssl)
-  #else
-          SSL_get_peer_certificate(ssl)
-  #endif
-        };
-        if (x509) {
-          store_verified_request_cert(request, crypto::pem(x509));
-        }
-      };
-
-      server->on_verify_failed = [](resp_https_t resp, req_https_t req) {
-        pt::ptree tree;
-        tree.put("root.<xmlattr>.status_code"s, 401);
-        tree.put("root.<xmlattr>.query"s, req->path);
-        tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
-        std::ostringstream data;
-        pt::write_xml(data, tree);
-        resp->write(data.str());
-        resp->close_connection_after_response = true;
-      };
-
-      auto post_to_https_server = [raw_server](std::function<void()> callback) {
-        raw_server->post_guarded(std::move(callback));
-      };
-
-      server->resource["^/launch$"]["GET"] = [&host_audio, raw_server, post_to_https_server](auto resp, auto req) {
-        launch(host_audio, resp, req, raw_server->io_service, post_to_https_server);
-      };
-      server->resource["^/resume$"]["GET"] = [&host_audio, raw_server, post_to_https_server](auto resp, auto req) {
-        resume(host_audio, resp, req, raw_server->io_service, post_to_https_server);
-      };
-      server->resource["^/cancel$"]["GET"] = cancel;
-      return server;
+      return std::make_unique<loopback_server_impl_t>(std::move(certificate_file), std::move(private_key_file));
     }
 
     std::string wait_for_pending_reconnect_id(

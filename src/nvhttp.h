@@ -533,17 +533,32 @@ namespace nvhttp {
     );
 
     /**
-     * @brief Create an HTTPS server configured with production client-cert verification and `/launch` + `/resume` routes.
+     * @brief Running loopback nvhttp server started through @ref nvhttp::start for tests.
+     */
+    struct loopback_server_t {
+      /**
+       * @brief Stop the loopback server when destroyed.
+       */
+      virtual ~loopback_server_t() = default;
+
+      /**
+       * @brief Return the assigned loopback HTTPS port, or `0` if startup failed.
+       *
+       * @return Bound HTTPS port.
+       */
+      virtual unsigned short https_port() const = 0;
+    };
+
+    /**
+     * @brief Start @ref nvhttp::start on `127.0.0.1` with ephemeral ports for loopback tests.
      *
      * @param certificate_file Path to the server certificate PEM file.
      * @param private_key_file Path to the matching private key PEM file.
-     * @param host_audio Mutable host-audio flag updated by `/launch` and `/resume`.
-     * @return Configured HTTPS server ready for loopback test requests.
+     * @return RAII handle whose destructor stops the running server.
      */
-    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_stream_https_server(
-      const std::string &certificate_file,
-      const std::string &private_key_file,
-      bool &host_audio
+    std::unique_ptr<loopback_server_t> start_loopback_server(
+      std::string certificate_file,
+      std::string private_key_file
     );
 
     /**

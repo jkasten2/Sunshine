@@ -8,13 +8,12 @@
 #include "../tests_common.h"
 
 // standard includes
-#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <future>
-#include <thread>
+#include <memory>
 #include <vector>
 
 // lib includes
@@ -82,8 +81,6 @@ namespace {
         temp_dir(fs::path {SUNSHINE_TEST_BIN_DIR} / subdir),
         client_cert_file(temp_dir / "client_cert.pem"),
         client_key_file(temp_dir / "client_key.pem") {
-      using namespace std::chrono_literals;
-
       const auto server_creds = crypto::gen_creds("Sunshine Test Stream Server", 2048);
       const auto client_creds = test_utils::certificates::generate_ca_credentials("Sunshine Test Stream Client");
 
@@ -101,32 +98,15 @@ namespace {
       EXPECT_FALSE(uuid.empty());
       EXPECT_TRUE(nvhttp::set_client_require_accept(uuid, require_accept));
 
-      server = nvhttp::test_support::make_stream_https_server(server_cert_file.string(), server_key_file.string(), host_audio);
-      server->config.address = "127.0.0.1";
-      server->config.port = 0;
-      std::promise<unsigned short> port_promise;
-      auto port_future = port_promise.get_future();
-      server_thread = std::jthread([this, port_promise = std::move(port_promise)]() mutable {
-        server->start([&port_promise](const unsigned short assigned_port) {
-          port_promise.set_value(assigned_port);
-        });
-      });
-
-      EXPECT_EQ(port_future.wait_for(2s), std::future_status::ready);
-      port = port_future.get();
-      EXPECT_NE(port, 0);
+      server = nvhttp::test_support::start_loopback_server(server_cert_file.string(), server_key_file.string());
+      EXPECT_NE(server->https_port(), 0);
     }
 
     /**
      * @brief Stop the HTTPS server and clean up temporary credential files.
      */
     ~StreamHttpsTestServer() {
-      if (server) {
-        server->stop();
-      }
-      if (server_thread.joinable()) {
-        server_thread.join();
-      }
+      server.reset();
       std::error_code remove_error;
       fs::remove_all(temp_dir, remove_error);
     }
@@ -139,7 +119,7 @@ namespace {
      */
     std::string get(const std::string &path) const {
       SimpleWeb::Client<SimpleWeb::HTTPS> https_client(
-        std::format("127.0.0.1:{}", port.load()),
+        std::format("127.0.0.1:{}", server->https_port()),
         false,
         client_cert_file.string(),
         client_key_file.string()
@@ -164,10 +144,7 @@ namespace {
     fs::path client_cert_file;  ///< Paired client certificate path.
     fs::path client_key_file;  ///< Paired client private key path.
     std::string uuid;  ///< Persistent UUID of the paired client.
-    bool host_audio = false;  ///< Host-audio state updated by stream handlers.
-    std::unique_ptr<SimpleWeb::ServerBase<nvhttp::SunshineHTTPS>> server;  ///< Loopback HTTPS server.
-    std::jthread server_thread;  ///< Background thread running the HTTPS server.
-    std::atomic<unsigned short> port {0};  ///< Assigned loopback port.
+    std::unique_ptr<nvhttp::test_support::loopback_server_t> server;  ///< Running loopback nvhttp server.
   };
 }  // namespace
 
