@@ -1519,6 +1519,40 @@ namespace nvhttp {
     }
 
     /**
+     * @brief Cancel and release the expiration timer of a pending reconnect entry.
+     *
+     * @param entry Pending reconnect entry whose timer should be stopped.
+     */
+    void cancel_reconnect_timer(pending_reconnect_entry_t &entry) {
+      if (entry.timer) {
+        entry.timer->cancel();
+        entry.timer.reset();
+      }
+    }
+
+    /**
+     * @brief Create a timer that expires pending reconnect requests after the approval timeout.
+     *
+     * @param io_service Optional HTTPS server I/O context.
+     * @return Armed timer, or `nullptr` when no I/O context is available.
+     */
+    std::shared_ptr<boost::asio::steady_timer> make_reconnect_expiration_timer(
+      const std::shared_ptr<boost::asio::io_context> &io_service
+    ) {
+      if (!io_service) {
+        return nullptr;
+      }
+
+      auto timer = std::make_shared<boost::asio::steady_timer>(*io_service, RECONNECT_APPROVAL_TIMEOUT);
+      timer->async_wait([](const boost::system::error_code &ec) {
+        if (!ec) {
+          expire_pending_reconnects();
+        }
+      });
+      return timer;
+    }
+
+    /**
      * @brief Write an XML failure response to a held reconnect request and close its connection.
      *
      * @param entry Held reconnect request whose response will be completed.
@@ -1530,10 +1564,7 @@ namespace nvhttp {
       const int status_code,
       const std::string_view status_message
     ) {
-      if (entry.timer) {
-        entry.timer->cancel();
-        entry.timer.reset();
-      }
+      cancel_reconnect_timer(entry);
       if (!entry.response) {
         return;
       }
@@ -1663,8 +1694,9 @@ namespace nvhttp {
           entries.erase(existing_it);
         }
 
-        if (entries.size() < MAX_PENDING_RECONNECT_REQUESTS) {
-          pending_reconnect_entry_t entry {
+        queued = entries.size() < MAX_PENDING_RECONNECT_REQUESTS;
+        if (queued) {
+          entries.push_back({
             .id = uuid_util::uuid_t::generate().string(),
             .client_uuid = client.uuid,
             .name = client.name,
@@ -1672,21 +1704,9 @@ namespace nvhttp {
             .action = std::move(action),
             .response = std::move(response),
             .on_approve = std::move(on_approve),
-            .timer = nullptr,
+            .timer = make_reconnect_expiration_timer(io_service),
             .expires_at = now + RECONNECT_APPROVAL_TIMEOUT,
-          };
-
-          if (io_service) {
-            entry.timer = std::make_shared<boost::asio::steady_timer>(*io_service, RECONNECT_APPROVAL_TIMEOUT);
-            entry.timer->async_wait([](const boost::system::error_code &ec) {
-              if (!ec) {
-                expire_pending_reconnects();
-              }
-            });
-          }
-
-          entries.push_back(std::move(entry));
-          queued = true;
+          });
         }
       }
 
@@ -1697,6 +1717,56 @@ namespace nvhttp {
       if (queued) {
         reconnect_condition().notify_all();
       }
+      return queued;
+    }
+
+    /**
+     * @brief Hold a launch or resume request until the operator approves it.
+     *
+     * Runs the approved work on the HTTPS server thread when `post_to_server` is provided, and
+     * notifies the system tray once the request is queued.
+     *
+     * @param client Persisted paired-client metadata.
+     * @param request HTTPS request being held.
+     * @param action GameStream action ("launch" or "resume").
+     * @param response Held HTTPS response object.
+     * @param io_service Optional HTTPS server I/O context used to arm an automatic expiration timer.
+     * @param post_to_server Optional scheduler that posts approved work back onto the HTTPS server thread.
+     * @param execute_approved Work that completes the request with the released response.
+     * @return `true` when queued; `false` when the bounded pending queue is full.
+     */
+    bool hold_for_reconnect_approval(
+      const named_cert_t &client,
+      const req_https_t &request,
+      std::string action,
+      resp_https_t response,
+      const std::shared_ptr<boost::asio::io_context> &io_service,
+      const std::function<void(std::function<void()>)> &post_to_server,
+      std::function<void(resp_https_t)> execute_approved
+    ) {
+      const bool queued = enqueue_reconnect_approval(
+        client,
+        net::addr_to_normalized_string(request->remote_endpoint().address()),
+        std::move(action),
+        std::move(response),
+        io_service,
+        [post_to_server, execute_approved = std::move(execute_approved)](resp_https_t approved_response) {
+          auto work = [execute_approved, approved_response = std::move(approved_response)]() mutable {
+            execute_approved(std::move(approved_response));
+          };
+          if (post_to_server) {
+            post_to_server(std::move(work));
+          } else {
+            work();
+          }
+        }
+      );
+
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+      if (queued) {
+        system_tray::update_tray_require_reconnect(client.name);
+      }
+#endif
       return queued;
     }
   }  // namespace
@@ -1755,10 +1825,7 @@ namespace nvhttp {
       return false;
     }
 
-    if (matched->timer) {
-      matched->timer->cancel();
-      matched->timer.reset();
-    }
+    cancel_reconnect_timer(*matched);
 
     if (!approve) {
       write_reconnect_failure_response(*matched, 403, "Connection request was denied by the host");
@@ -1988,27 +2055,15 @@ namespace nvhttp {
 
     const std::string client_name = client_record ? client_record->name : last_verified_client_name;
     if (client_record && client_record->require_accept) {
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-      const bool queued = enqueue_reconnect_approval(
+      const bool queued = hold_for_reconnect_approval(
         *client_record,
-        std::move(address),
+        request,
         "launch"s,
         response,
         io_service,
-        [&host_audio, request, args = std::move(args), client_cert, client_name, post_to_server](resp_https_t approved_response) mutable {
-          auto work = [&host_audio,
-                       approved_response = std::move(approved_response),
-                       request = std::move(request),
-                       args = std::move(args),
-                       client_cert = std::move(client_cert),
-                       client_name = std::move(client_name)]() mutable {
-            execute_launch_approved(host_audio, std::move(approved_response), std::move(request), args, client_cert, client_name);
-          };
-          if (post_to_server) {
-            post_to_server(std::move(work));
-          } else {
-            work();
-          }
+        post_to_server,
+        [&host_audio, request, args, client_cert, client_name](resp_https_t approved_response) {
+          execute_launch_approved(host_audio, std::move(approved_response), request, args, client_cert, client_name);
         }
       );
       if (!queued) {
@@ -2019,9 +2074,6 @@ namespace nvhttp {
       }
 
       g.disable();
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-      system_tray::update_tray_require_reconnect(client_record->name);
-#endif
       return;
     }
 
@@ -2186,27 +2238,15 @@ namespace nvhttp {
 
     const std::string client_name = client_record ? client_record->name : last_verified_client_name;
     if (client_record && client_record->require_accept) {
-      auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
-      const bool queued = enqueue_reconnect_approval(
+      const bool queued = hold_for_reconnect_approval(
         *client_record,
-        std::move(address),
+        request,
         "resume"s,
         response,
         io_service,
-        [&host_audio, request, args = std::move(args), client_cert, client_name, post_to_server](resp_https_t approved_response) mutable {
-          auto work = [&host_audio,
-                       approved_response = std::move(approved_response),
-                       request = std::move(request),
-                       args = std::move(args),
-                       client_cert = std::move(client_cert),
-                       client_name = std::move(client_name)]() mutable {
-            execute_resume_approved(host_audio, std::move(approved_response), std::move(request), args, client_cert, client_name);
-          };
-          if (post_to_server) {
-            post_to_server(std::move(work));
-          } else {
-            work();
-          }
+        post_to_server,
+        [&host_audio, request, args, client_cert, client_name](resp_https_t approved_response) {
+          execute_resume_approved(host_audio, std::move(approved_response), request, args, client_cert, client_name);
         }
       );
       if (!queued) {
@@ -2217,9 +2257,6 @@ namespace nvhttp {
       }
 
       g.disable();
-#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
-      system_tray::update_tray_require_reconnect(client_record->name);
-#endif
       return;
     }
 
