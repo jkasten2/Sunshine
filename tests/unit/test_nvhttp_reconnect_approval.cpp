@@ -217,7 +217,7 @@ TEST_F(ReconnectApprovalTest, ReconnectQueueLifecycleSupersedesExpiresBoundsAndC
   auto pending = nvhttp::get_pending_reconnects();
   ASSERT_EQ(pending.size(), 1);
   EXPECT_EQ(pending.front().id, superseded_id);
-  EXPECT_EQ(pending.front().uuid, first_uuid);
+  EXPECT_EQ(pending.front().client_uuid, first_uuid);
   EXPECT_EQ(pending.front().name, "Desktop");
   EXPECT_EQ(pending.front().address, "192.0.2.11");
   EXPECT_EQ(pending.front().action, "resume");

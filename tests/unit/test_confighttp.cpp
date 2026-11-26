@@ -782,7 +782,7 @@ TEST_F(ConfigHttpTest, ClientUpdateAndReconnectMutationsRejectUnauthenticatedAnd
     client->request(
             "POST",
             "/clients-reconnect-test",
-            R"({"request_id":"0123456789abcdef0123456789abcdef","approve":true})",
+            R"({"request_id":"AAAAAAAA-AAAA-4AAA-BAAA-AAAAAAAAAAAA","approve":true})",
             unauth_headers
     )
       ->status_code,
@@ -806,7 +806,7 @@ TEST_F(ConfigHttpTest, ClientUpdateAndReconnectMutationsRejectUnauthenticatedAnd
   const auto reconnect_csrf = client->request(
     "POST",
     "/clients-reconnect-test",
-    R"({"request_id":"0123456789abcdef0123456789abcdef","approve":true})",
+    R"({"request_id":"aaaaaaaa-aaaa-4aaa-baaa-aaaaaaaaaaaa","approve":true})",
     csrf_headers
   );
   EXPECT_EQ(reconnect_csrf->status_code, "400 Bad Request");
@@ -910,7 +910,7 @@ TEST_F(ConfigHttpTest, ClientReconnectRestApiListsValidatesAndResolvesPendingReq
   EXPECT_TRUE(list_body.at("status").get<bool>());
   ASSERT_EQ(list_body.at("reconnects").size(), 1);
   EXPECT_EQ(list_body.at("reconnects").front().at("id"), request_id);
-  EXPECT_EQ(list_body.at("reconnects").front().at("uuid"), uuid);
+  EXPECT_EQ(list_body.at("reconnects").front().at("client_uuid"), uuid);
   EXPECT_EQ(list_body.at("reconnects").front().at("name"), "Living Room TV");
   EXPECT_EQ(list_body.at("reconnects").front().at("address"), "192.0.2.55");
   EXPECT_EQ(list_body.at("reconnects").front().at("action"), "launch");

@@ -1471,6 +1471,7 @@ namespace confighttp {
     ss << request->content.rdbuf();
     try {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
+
       if (!input_tree.is_object() || !input_tree.contains("uuid") || !input_tree["uuid"].is_string()) {
         bad_request(response, "uuid must be a string");
         return;
@@ -1546,7 +1547,7 @@ namespace confighttp {
     for (const auto &reconnect : nvhttp::get_pending_reconnects()) {
       output_tree["reconnects"].push_back({
         {"id", reconnect.id},
-        {"uuid", reconnect.uuid},
+        {"client_uuid", reconnect.client_uuid},
         {"name", reconnect.name},
         {"address", reconnect.address},
         {"action", reconnect.action},
@@ -1563,12 +1564,12 @@ namespace confighttp {
    * The body for the POST request should be JSON serialized in the following format:
    * @code{.json}
    * {
-   *   "request_id": "0123456789abcdef0123456789abcdef",
+   *   "request_id": "AAAAAAAA-AAAA-4AAA-BAAA-AAAAAAAAAAAA",
    *   "approve": true
    * }
    * @endcode
    *
-   * @api_examples{/api/clients/reconnect|:| POST|:| {"request_id":"0123456789abcdef0123456789abcdef","approve":true}}
+   * @api_examples{/api/clients/reconnect|:| POST|:| {"request_id":"AAAAAAAA-AAAA-4AAA-BAAA-AAAAAAAAAAAA","approve":true}}
    */
   void resolvePendingReconnect(const resp_https_t &response, const req_https_t &request) {
     if (!check_content_type(response, request, "application/json")) {
@@ -1597,8 +1598,8 @@ namespace confighttp {
       const std::string request_id = input_tree.contains("request_id") && input_tree["request_id"].is_string() ?
                                        input_tree["request_id"].get<std::string>() :
                                        std::string {};
-      if (!nvhttp::is_valid_pairing_id(request_id)) {
-        bad_request(response, "request_id must contain exactly 32 hexadecimal characters");
+      if (request_id.size() != 36) {
+        bad_request(response, "request_id must be a valid UUID");
         return;
       }
       if (!input_tree.contains("approve") || !input_tree["approve"].is_boolean()) {

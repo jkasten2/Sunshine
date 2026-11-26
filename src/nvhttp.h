@@ -190,7 +190,7 @@ namespace nvhttp {
    */
   struct pending_reconnect_t {
     std::string id;  ///< Unguessable approval identifier.
-    std::string uuid;  ///< Persistent UUID of the paired client.
+    std::string client_uuid;  ///< Persistent UUID of the paired client.
     std::string name;  ///< Friendly paired-client name assigned in Sunshine.
     std::string address;  ///< Network address from which the request originated.
     std::string action;  ///< Requested GameStream action ("launch" or "resume").

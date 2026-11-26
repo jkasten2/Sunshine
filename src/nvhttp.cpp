@@ -1375,7 +1375,7 @@ namespace nvhttp {
      */
     struct pending_reconnect_entry_t {
       std::string id;  ///< Unguessable hexadecimal approval identifier.
-      std::string uuid;  ///< Persistent UUID of the paired client.
+      std::string client_uuid;  ///< Persistent UUID of the paired client.
       std::string name;  ///< Friendly paired-client name.
       std::string address;  ///< Network address of the connecting client.
       std::string action;  ///< GameStream endpoint action ("launch" or "resume").
@@ -1598,7 +1598,7 @@ namespace nvhttp {
         std::lock_guard lock {reconnect_mutex()};
         auto &entries = pending_reconnect_entries();
         for (auto it = entries.begin(); it != entries.end();) {
-          if (it->uuid == uuid) {
+          if (it->client_uuid == uuid) {
             cancelled.push_back(std::move(*it));
             it = entries.erase(it);
           } else {
@@ -1657,23 +1657,16 @@ namespace nvhttp {
         expired = take_expired_reconnects_unlocked(now);
 
         auto &entries = pending_reconnect_entries();
-        if (const auto existing_it = std::ranges::find(entries, client.uuid, &pending_reconnect_entry_t::uuid);
+        if (const auto existing_it = std::ranges::find(entries, client.uuid, &pending_reconnect_entry_t::client_uuid);
             existing_it != entries.end()) {
           superseded = std::move(*existing_it);
           entries.erase(existing_it);
         }
 
         if (entries.size() < MAX_PENDING_RECONNECT_REQUESTS) {
-          std::string request_id;
-          do {
-            request_id = crypto::rand_alphabet(PAIRING_ID_SIZE, "0123456789abcdef"sv);
-          } while (std::ranges::any_of(entries, [&](const auto &entry) {
-            return entry.id == request_id;
-          }));
-
           pending_reconnect_entry_t entry {
-            .id = request_id,
-            .uuid = client.uuid,
+            .id = uuid_util::uuid_t::generate().string(),
+            .client_uuid = client.uuid,
             .name = client.name,
             .address = std::move(address),
             .action = std::move(action),
@@ -1728,7 +1721,7 @@ namespace nvhttp {
       for (const auto &entry : entries) {
         result.push_back({
           .id = entry.id,
-          .uuid = entry.uuid,
+          .client_uuid = entry.client_uuid,
           .name = entry.name,
           .address = entry.address,
           .action = entry.action,
@@ -1740,7 +1733,7 @@ namespace nvhttp {
   }
 
   bool resolve_pending_reconnect(const std::string_view request_id, const bool approve) {
-    if (!is_valid_pairing_id(request_id)) {
+    if (request_id.empty()) {
       return false;
     }
 
@@ -1772,7 +1765,7 @@ namespace nvhttp {
       return true;
     }
 
-    const auto client = find_client_by_uuid(matched->uuid);
+    const auto client = find_client_by_uuid(matched->client_uuid);
     if (!client || !client->enabled) {
       write_reconnect_failure_response(*matched, 403, "Client is no longer authorized to connect");
       return false;
@@ -2535,6 +2528,7 @@ namespace nvhttp {
     for (auto &named_cert : client_root.named_devices) {
       if (named_cert.uuid == uuid) {
         named_cert.require_accept = require_accept;
+        // TODO: I think we need to clean up pending reconnects here if require_accept is false
         save_state();
         return true;
       }
@@ -2689,7 +2683,7 @@ namespace nvhttp {
 
       std::lock_guard lock {reconnect_mutex()};
       const auto &entries = pending_reconnect_entries();
-      const auto it = std::ranges::find(entries, uuid, &pending_reconnect_entry_t::uuid);
+      const auto it = std::ranges::find(entries, uuid, &pending_reconnect_entry_t::client_uuid);
       return it != entries.end() ? it->id : std::string {};
     }
 
@@ -2703,11 +2697,11 @@ namespace nvhttp {
 
       server->verify = [](SSL *ssl) {
         crypto::x509_t x509 {
-#if OPENSSL_VERSION_MAJOR >= 3
+  #if OPENSSL_VERSION_MAJOR >= 3
           SSL_get1_peer_certificate(ssl)
-#else
+  #else
           SSL_get_peer_certificate(ssl)
-#endif
+  #endif
         };
         if (!x509) {
           return 0;
@@ -2731,11 +2725,11 @@ namespace nvhttp {
 
       server->on_verified = [](const req_https_t &request, SSL *ssl) {
         crypto::x509_t x509 {
-#if OPENSSL_VERSION_MAJOR >= 3
+  #if OPENSSL_VERSION_MAJOR >= 3
           SSL_get1_peer_certificate(ssl)
-#else
+  #else
           SSL_get_peer_certificate(ssl)
-#endif
+  #endif
         };
         if (x509) {
           store_verified_request_cert(request, crypto::pem(x509));

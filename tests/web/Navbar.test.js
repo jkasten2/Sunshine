@@ -30,8 +30,8 @@ describe('ReconnectBanner', () => {
     let payload = {
       status: true,
       reconnects: [
-        { id: '0123456789abcdef0123456789abcdef', uuid: 'u1', name: 'Laptop', address: '192.168.1.20', action: 'launch' },
-        { id: 'fedcba9876543210fedcba9876543210', uuid: 'u2', name: '', address: '', action: 'resume' },
+        { id: 'AAAAAAAA-AAAA-4AAA-BAAA-AAAAAAAAAAAA', uuid: 'u1', name: 'Laptop', address: '192.168.1.20', action: 'launch' },
+        { id: 'BBBBBBBB-BBBB-4BBB-BBBB-BBBBBBBBBBBB', uuid: 'u2', name: '', address: '', action: 'resume' },
       ],
     }
     let ok = true
@@ -66,7 +66,7 @@ describe('ReconnectBanner', () => {
 
   it('submits accept, deny, failure, and network-error outcomes', async () => {
     let reconnects = [
-      { id: '0123456789abcdef0123456789abcdef', uuid: 'u1', name: 'TV', address: '10.0.0.5', action: 'launch' },
+      { id: 'AAAAAAAA-AAAA-4AAA-BAAA-AAAAAAAAAAAA', uuid: 'u1', name: 'TV', address: '10.0.0.5', action: 'launch' },
     ]
     let postBehavior = 'approve_ok'
 
@@ -95,11 +95,11 @@ describe('ReconnectBanner', () => {
     await flushPromises()
     expect(fetch).toHaveBeenCalledWith('./api/clients/reconnect', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({ request_id: '0123456789abcdef0123456789abcdef', approve: true }),
+      body: JSON.stringify({ request_id: 'AAAAAAAA-AAAA-4AAA-BAAA-AAAAAAAAAAAA', approve: true }),
     }))
     expect(notificationState.notifications.at(-1)?.messageKey).toBe('reconnect.approve_success')
 
-    reconnects = [{ id: '11111111111111111111111111111111', uuid: 'u2', name: 'Phone', address: '10.0.0.6', action: 'launch' }]
+    reconnects = [{ id: '11111111111111111111111111111111', client_uuid: 'u2', name: 'Phone', address: '10.0.0.6', action: 'launch' }]
     postBehavior = 'deny_ok'
     vi.advanceTimersByTime(2000)
     await flushPromises()
@@ -107,7 +107,7 @@ describe('ReconnectBanner', () => {
     await flushPromises()
     expect(notificationState.notifications.at(-1)?.messageKey).toBe('reconnect.deny_success')
 
-    reconnects = [{ id: '22222222222222222222222222222222', uuid: 'u3', name: 'Tablet', address: '10.0.0.7', action: 'launch' }]
+    reconnects = [{ id: '22222222222222222222222222222222', client_uuid: 'u3', name: 'Tablet', address: '10.0.0.7', action: 'launch' }]
     postBehavior = 'status_false'
     vi.advanceTimersByTime(2000)
     await flushPromises()
@@ -115,7 +115,7 @@ describe('ReconnectBanner', () => {
     await flushPromises()
     expect(notificationState.notifications.at(-1)?.messageKey).toBe('reconnect.resolve_failure')
 
-    reconnects = [{ id: '33333333333333333333333333333333', uuid: 'u4', name: 'Deck', address: '10.0.0.8', action: 'launch' }]
+    reconnects = [{ id: '33333333333333333333333333333333', client_uuid: 'u4', name: 'Deck', address: '10.0.0.8', action: 'launch' }]
     postBehavior = 'throw'
     vi.advanceTimersByTime(2000)
     await flushPromises()
