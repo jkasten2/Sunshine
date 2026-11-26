@@ -16,8 +16,10 @@
 #include <utility>
 
 // lib includes
+#include <boost/asio/post.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/context_base.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
@@ -83,7 +85,25 @@ namespace nvhttp {
     }
 
     std::function<int(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
+    std::function<void(const std::shared_ptr<Request> &, SSL *)> on_verified;  ///< Optional callback invoked after TLS client verification succeeds.
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
+
+    /**
+     * @brief Post a callback onto the server's I/O context guarded by its handler lifetime scope.
+     *
+     * @param callback Work item to execute on the HTTPS server thread while the server remains active.
+     */
+    void post_guarded(std::function<void()> callback) {
+      if (!io_service || !handler_runner) {
+        callback();
+        return;
+      }
+      boost::asio::post(*io_service, [runner = handler_runner, cb = std::move(callback)]() mutable {
+        if (auto lock = runner->continue_lock(); lock) {
+          cb();
+        }
+      });
+    }
 
   protected:
     boost::asio::ssl::context context {boost::asio::ssl::context::tls_server};  ///< TLS server context configured with Sunshine's certificate and protocol policy.
@@ -111,9 +131,13 @@ namespace nvhttp {
      */
     void handle_handshake(const std::shared_ptr<Session> &session, const SimpleWeb::error_code &ec) {
       if (!ec) {
-        if (verify && !verify(session->connection->socket->native_handle())) {
+        auto *ssl = session->connection->socket->native_handle();
+        if (verify && !verify(ssl)) {
           this->write(session, on_verify_failed);
         } else {
+          if (on_verified) {
+            on_verified(session->request, ssl);
+          }
           this->read(session);
         }
       } else if (this->on_error) {
@@ -184,6 +208,7 @@ namespace nvhttp {
     std::string uuid;  ///< Persistent Moonlight client UUID associated with the certificate.
     std::string cert;  ///< Certificate PEM string or path.
     bool enabled = true;  ///< Whether this persisted client entry may connect.
+    bool require_accept = false;  ///< Whether starting or resuming a stream requires operator approval.
   };
 
   /**
@@ -290,6 +315,7 @@ namespace nvhttp {
       named_cert_node.put("cert"s, named_cert.cert);
       named_cert_node.put("uuid"s, named_cert.uuid);
       named_cert_node.put("enabled"s, named_cert.enabled);
+      named_cert_node.put("require_accept"s, named_cert.require_accept);
       named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
     }
     root.add_child("root.named_devices"s, named_cert_nodes);
@@ -426,6 +452,7 @@ namespace nvhttp {
         named_cert.cert = el.get_child("cert").get_value<std::string>();
         named_cert.uuid = el.get_child("uuid").get_value<std::string>();
         named_cert.enabled = el.get<bool>("enabled", true);
+        named_cert.require_accept = el.get<bool>("require_accept", false);
         client.named_devices.emplace_back(named_cert);
       }
     }
@@ -482,9 +509,16 @@ namespace nvhttp {
    *
    * @param host_audio Host audio.
    * @param args Arguments forwarded to the callable or parser.
+   * @param client_cert Optional verified client certificate PEM override.
+   * @param client_name Optional verified client friendly name override.
    * @return Constructed launch session object.
    */
-  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args) {
+  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(
+    bool host_audio,
+    const args_t &args,
+    const std::optional<std::string> &client_cert = std::nullopt,
+    const std::optional<std::string> &client_name = std::nullopt
+  ) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
     launch_session->id = ++session_id_counter;
@@ -532,8 +566,8 @@ namespace nvhttp {
       launch_session->rtsp_iv_counter = 0;
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
-    launch_session->client_cert = last_verified_client_cert;
-    launch_session->client_name = last_verified_client_name;
+    launch_session->client_cert = client_cert.value_or(last_verified_client_cert);
+    launch_session->client_name = client_name.value_or(last_verified_client_name);
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     std::array<unsigned char, 8> raw_payload;
@@ -1328,10 +1362,486 @@ namespace nvhttp {
       named_cert_node["name"] = named_cert.name;
       named_cert_node["uuid"] = named_cert.uuid;
       named_cert_node["enabled"] = named_cert.enabled;
+      named_cert_node["require_accept"] = named_cert.require_accept;
       named_cert_nodes.push_back(named_cert_node);
     }
 
     return named_cert_nodes;
+  }
+
+  namespace {
+    /**
+     * @brief Held reconnect approval state for a paired Moonlight client.
+     */
+    struct pending_reconnect_entry_t {
+      std::string id;  ///< Unguessable hexadecimal approval identifier.
+      std::string client_uuid;  ///< Persistent UUID of the paired client.
+      std::string name;  ///< Friendly paired-client name.
+      std::string address;  ///< Network address of the connecting client.
+      std::string action;  ///< GameStream endpoint action ("launch" or "resume").
+      resp_https_t response;  ///< Held HTTPS response completed on resolution or timeout.
+      std::function<void(resp_https_t)> on_approve;  ///< Continuation executed when approved.
+      std::shared_ptr<boost::asio::steady_timer> timer;  ///< Optional deadline timer on the HTTPS I/O context.
+      std::chrono::steady_clock::time_point expires_at = std::chrono::steady_clock::time_point::max();  ///< Monotonic expiration deadline.
+    };
+
+    /**
+     * @brief Access the mutex protecting pending reconnect approval requests.
+     *
+     * @return Mutex serializing pending reconnect request state.
+     */
+    std::mutex &reconnect_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
+    /**
+     * @brief Access the condition variable notified when pending reconnect requests change.
+     *
+     * @return Condition variable signaled after queueing a new reconnect request.
+     */
+    std::condition_variable &reconnect_condition() {
+      static std::condition_variable cv;
+      return cv;
+    }
+
+    /**
+     * @brief Access in-memory storage of pending reconnect approval requests.
+     *
+     * @return Vector of pending reconnect entries in insertion order.
+     */
+    std::vector<pending_reconnect_entry_t> &pending_reconnect_entries() {
+      static std::vector<pending_reconnect_entry_t> entries;
+      return entries;
+    }
+
+    /**
+     * @brief Access the mutex protecting per-request verified client certificates.
+     *
+     * @return Mutex serializing request-to-certificate associations.
+     */
+    std::mutex &verified_request_certs_mutex() {
+      static std::mutex mutex;
+      return mutex;
+    }
+
+    /**
+     * @brief Access weak request-to-certificate mappings recorded after TLS verification.
+     *
+     * @return Active request certificate associations.
+     */
+    std::vector<std::pair<std::weak_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request>, std::string>> &verified_request_certs() {
+      static std::vector<std::pair<std::weak_ptr<typename SimpleWeb::ServerBase<SunshineHTTPS>::Request>, std::string>> entries;
+      return entries;
+    }
+
+    /**
+     * @brief Record the verified client certificate PEM for an active HTTPS request.
+     *
+     * @param request Active HTTPS request owned by the session.
+     * @param cert_pem Canonical PEM-encoded client certificate.
+     */
+    void store_verified_request_cert(const req_https_t &request, std::string cert_pem) {
+      if (!request || cert_pem.empty()) {
+        return;
+      }
+
+      std::lock_guard lock {verified_request_certs_mutex()};
+      auto &entries = verified_request_certs();
+      std::erase_if(entries, [&request](const auto &entry) {
+        const auto locked = entry.first.lock();
+        return !locked || locked.get() == request.get();
+      });
+      entries.emplace_back(request, std::move(cert_pem));
+    }
+
+    /**
+     * @brief Look up the verified client certificate PEM associated with an HTTPS request.
+     *
+     * @param request HTTPS request being processed.
+     * @return Canonical PEM-encoded client certificate, or fallback last verified cert.
+     */
+    std::string find_verified_request_cert(const req_https_t &request) {
+      {
+        std::lock_guard lock {verified_request_certs_mutex()};
+        auto &entries = verified_request_certs();
+        for (auto it = entries.begin(); it != entries.end();) {
+          const auto locked = it->first.lock();
+          if (!locked) {
+            it = entries.erase(it);
+            continue;
+          }
+          if (locked.get() == request.get()) {
+            return it->second;
+          }
+          ++it;
+        }
+      }
+
+      std::lock_guard auth_lock {client_auth_mutex()};
+      return last_verified_client_cert;
+    }
+
+    /**
+     * @brief Look up a persisted paired-client record by canonical PEM certificate.
+     *
+     * @param cert_pem Canonical PEM-encoded client certificate.
+     * @return Matching paired-client record copy, or `std::nullopt` when absent.
+     */
+    std::optional<named_cert_t> find_client_by_cert(const std::string_view cert_pem) {
+      if (cert_pem.empty()) {
+        return std::nullopt;
+      }
+
+      std::lock_guard lock {client_auth_mutex()};
+      for (const auto &named_cert : client_root.named_devices) {
+        if (named_cert.cert == cert_pem) {
+          return named_cert;
+        }
+      }
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Look up a persisted paired-client record by persistent UUID.
+     *
+     * @param uuid Persistent paired-client UUID.
+     * @return Matching paired-client record copy, or `std::nullopt` when absent.
+     */
+    std::optional<named_cert_t> find_client_by_uuid(const std::string_view uuid) {
+      std::lock_guard lock {client_auth_mutex()};
+      for (const auto &named_cert : client_root.named_devices) {
+        if (named_cert.uuid == uuid) {
+          return named_cert;
+        }
+      }
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Cancel and release the expiration timer of a pending reconnect entry.
+     *
+     * @param entry Pending reconnect entry whose timer should be stopped.
+     */
+    void cancel_reconnect_timer(pending_reconnect_entry_t &entry) {
+      if (entry.timer) {
+        entry.timer->cancel();
+        entry.timer.reset();
+      }
+    }
+
+    /**
+     * @brief Create a timer that expires pending reconnect requests after the approval timeout.
+     *
+     * @param io_service Optional HTTPS server I/O context.
+     * @return Armed timer, or `nullptr` when no I/O context is available.
+     */
+    std::shared_ptr<boost::asio::steady_timer> make_reconnect_expiration_timer(
+      const std::shared_ptr<boost::asio::io_context> &io_service
+    ) {
+      if (!io_service) {
+        return nullptr;
+      }
+
+      auto timer = std::make_shared<boost::asio::steady_timer>(*io_service, RECONNECT_APPROVAL_TIMEOUT);
+      timer->async_wait([](const boost::system::error_code &ec) {
+        if (!ec) {
+          expire_pending_reconnects();
+        }
+      });
+      return timer;
+    }
+
+    /**
+     * @brief Write an XML failure response to a held reconnect request and close its connection.
+     *
+     * @param entry Held reconnect request whose response will be completed.
+     * @param status_code GameStream XML status code.
+     * @param status_message Human-readable status message returned to Moonlight.
+     */
+    void write_reconnect_failure_response(
+      pending_reconnect_entry_t &entry,
+      const int status_code,
+      const std::string_view status_message
+    ) {
+      cancel_reconnect_timer(entry);
+      if (!entry.response) {
+        return;
+      }
+
+      pt::ptree tree;
+      tree.put("root.<xmlattr>.status_code", status_code);
+      tree.put("root.<xmlattr>.status_message", std::string {status_message});
+      if (entry.action == "resume"sv) {
+        tree.put("root.resume", 0);
+      } else {
+        tree.put("root.gamesession", 0);
+      }
+
+      std::ostringstream data;
+      pt::write_xml(data, tree);
+      entry.response->close_connection_after_response = true;
+      entry.response->write(data.str());
+      entry.response.reset();
+    }
+
+    /**
+     * @brief Collect expired pending reconnect entries while `reconnect_mutex()` is held.
+     *
+     * @param now Monotonic timestamp used to evaluate deadlines.
+     * @return Extracted expired entries whose responses should be completed outside the lock.
+     */
+    std::vector<pending_reconnect_entry_t> take_expired_reconnects_unlocked(
+      const std::chrono::steady_clock::time_point now
+    ) {
+      std::vector<pending_reconnect_entry_t> expired;
+      auto &entries = pending_reconnect_entries();
+      for (auto it = entries.begin(); it != entries.end();) {
+        if (it->expires_at > now) {
+          ++it;
+          continue;
+        }
+        expired.push_back(std::move(*it));
+        it = entries.erase(it);
+      }
+      return expired;
+    }
+
+    /**
+     * @brief Complete a batch of expired reconnect entries with a 408 timeout XML response.
+     *
+     * @param expired Extracted expired reconnect entries.
+     */
+    void complete_expired_reconnects(std::vector<pending_reconnect_entry_t> &expired) {
+      for (auto &entry : expired) {
+        write_reconnect_failure_response(entry, 408, "Connection request timed out waiting for host approval");
+      }
+    }
+
+    /**
+     * @brief Cancel and reject any pending reconnect requests belonging to a specific client UUID.
+     *
+     * @param uuid Persistent UUID of the disabled or unpaired client.
+     */
+    void cancel_pending_reconnects_for_client(const std::string_view uuid) {
+      std::vector<pending_reconnect_entry_t> cancelled;
+      {
+        std::lock_guard lock {reconnect_mutex()};
+        auto &entries = pending_reconnect_entries();
+        for (auto it = entries.begin(); it != entries.end();) {
+          if (it->client_uuid == uuid) {
+            cancelled.push_back(std::move(*it));
+            it = entries.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      }
+
+      for (auto &entry : cancelled) {
+        write_reconnect_failure_response(entry, 403, "Client is no longer authorized to connect");
+      }
+    }
+
+    /**
+     * @brief Cancel and reject all pending reconnect requests.
+     */
+    void cancel_all_pending_reconnects() {
+      std::vector<pending_reconnect_entry_t> cancelled;
+      {
+        std::lock_guard lock {reconnect_mutex()};
+        cancelled.swap(pending_reconnect_entries());
+      }
+
+      for (auto &entry : cancelled) {
+        write_reconnect_failure_response(entry, 403, "Connection request cancelled");
+      }
+    }
+
+    /**
+     * @brief Queue a reconnect approval request for a paired client.
+     *
+     * Supersedes any earlier pending reconnect request from the same client UUID.
+     *
+     * @param client Persisted paired-client metadata.
+     * @param address Remote client network address.
+     * @param action GameStream action ("launch" or "resume").
+     * @param response Held HTTPS response object.
+     * @param io_service Optional HTTPS server I/O context used to arm an automatic expiration timer.
+     * @param on_approve Continuation executed if the operator approves the request.
+     * @return `true` when queued; `false` when the bounded pending queue is full.
+     */
+    bool enqueue_reconnect_approval(
+      const named_cert_t &client,
+      std::string address,
+      std::string action,
+      resp_https_t response,
+      const std::shared_ptr<boost::asio::io_context> &io_service,
+      std::function<void(resp_https_t)> on_approve
+    ) {
+      std::vector<pending_reconnect_entry_t> expired;
+      std::optional<pending_reconnect_entry_t> superseded;
+      bool queued = false;
+      {
+        std::lock_guard lock {reconnect_mutex()};
+        const auto now = std::chrono::steady_clock::now();
+        expired = take_expired_reconnects_unlocked(now);
+
+        auto &entries = pending_reconnect_entries();
+        if (const auto existing_it = std::ranges::find(entries, client.uuid, &pending_reconnect_entry_t::client_uuid);
+            existing_it != entries.end()) {
+          superseded = std::move(*existing_it);
+          entries.erase(existing_it);
+        }
+
+        queued = entries.size() < MAX_PENDING_RECONNECT_REQUESTS;
+        if (queued) {
+          entries.push_back({
+            .id = uuid_util::uuid_t::generate().string(),
+            .client_uuid = client.uuid,
+            .name = client.name,
+            .address = std::move(address),
+            .action = std::move(action),
+            .response = std::move(response),
+            .on_approve = std::move(on_approve),
+            .timer = make_reconnect_expiration_timer(io_service),
+            .expires_at = now + RECONNECT_APPROVAL_TIMEOUT,
+          });
+        }
+      }
+
+      complete_expired_reconnects(expired);
+      if (superseded) {
+        write_reconnect_failure_response(*superseded, 409, "Superseded by a newer connection request");
+      }
+      if (queued) {
+        reconnect_condition().notify_all();
+      }
+      return queued;
+    }
+
+    /**
+     * @brief Hold a launch or resume request until the operator approves it.
+     *
+     * Runs the approved work on the HTTPS server thread when `post_to_server` is provided, and
+     * notifies the system tray once the request is queued.
+     *
+     * @param client Persisted paired-client metadata.
+     * @param request HTTPS request being held.
+     * @param action GameStream action ("launch" or "resume").
+     * @param response Held HTTPS response object.
+     * @param io_service Optional HTTPS server I/O context used to arm an automatic expiration timer.
+     * @param post_to_server Optional scheduler that posts approved work back onto the HTTPS server thread.
+     * @param execute_approved Work that completes the request with the released response.
+     * @return `true` when queued; `false` when the bounded pending queue is full.
+     */
+    bool hold_for_reconnect_approval(
+      const named_cert_t &client,
+      const req_https_t &request,
+      std::string action,
+      resp_https_t response,
+      const std::shared_ptr<boost::asio::io_context> &io_service,
+      const std::function<void(std::function<void()>)> &post_to_server,
+      std::function<void(resp_https_t)> execute_approved
+    ) {
+      const bool queued = enqueue_reconnect_approval(
+        client,
+        net::addr_to_normalized_string(request->remote_endpoint().address()),
+        std::move(action),
+        std::move(response),
+        io_service,
+        [post_to_server, execute_approved = std::move(execute_approved)](resp_https_t approved_response) {
+          auto work = [execute_approved, approved_response = std::move(approved_response)]() mutable {
+            execute_approved(std::move(approved_response));
+          };
+          if (post_to_server) {
+            post_to_server(std::move(work));
+          } else {
+            work();
+          }
+        }
+      );
+
+#if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
+      if (queued) {
+        system_tray::update_tray_require_reconnect(client.name);
+      }
+#endif
+      return queued;
+    }
+  }  // namespace
+
+  void expire_pending_reconnects(const std::chrono::steady_clock::time_point now) {
+    std::vector<pending_reconnect_entry_t> expired;
+    {
+      std::lock_guard lock {reconnect_mutex()};
+      expired = take_expired_reconnects_unlocked(now);
+    }
+    complete_expired_reconnects(expired);
+  }
+
+  std::vector<pending_reconnect_t> get_pending_reconnects() {
+    std::vector<pending_reconnect_entry_t> expired;
+    std::vector<pending_reconnect_t> result;
+    {
+      std::lock_guard lock {reconnect_mutex()};
+      expired = take_expired_reconnects_unlocked(std::chrono::steady_clock::now());
+      const auto &entries = pending_reconnect_entries();
+      result.reserve(entries.size());
+      for (const auto &entry : entries) {
+        result.push_back({
+          .id = entry.id,
+          .client_uuid = entry.client_uuid,
+          .name = entry.name,
+          .address = entry.address,
+          .action = entry.action,
+        });
+      }
+    }
+    complete_expired_reconnects(expired);
+    return result;
+  }
+
+  bool resolve_pending_reconnect(const std::string_view request_id, const bool approve) {
+    if (request_id.empty()) {
+      return false;
+    }
+
+    std::vector<pending_reconnect_entry_t> expired;
+    std::optional<pending_reconnect_entry_t> matched;
+    {
+      std::lock_guard lock {reconnect_mutex()};
+      expired = take_expired_reconnects_unlocked(std::chrono::steady_clock::now());
+      auto &entries = pending_reconnect_entries();
+      const auto it = std::ranges::find(entries, request_id, &pending_reconnect_entry_t::id);
+      if (it != entries.end()) {
+        matched = std::move(*it);
+        entries.erase(it);
+      }
+    }
+    complete_expired_reconnects(expired);
+
+    if (!matched) {
+      return false;
+    }
+
+    cancel_reconnect_timer(*matched);
+
+    if (!approve) {
+      write_reconnect_failure_response(*matched, 403, "Connection request was denied by the host");
+      return true;
+    }
+
+    const auto client = find_client_by_uuid(matched->client_uuid);
+    if (!client || !client->enabled) {
+      write_reconnect_failure_response(*matched, 403, "Client is no longer authorized to connect");
+      return false;
+    }
+
+    if (matched->on_approve) {
+      matched->on_approve(std::move(matched->response));
+    }
+    return true;
   }
 
   /**
@@ -1370,15 +1880,23 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Launch the requested application for a GameStream session.
+   * @brief Complete an authorized GameStream application launch and write the XML response.
    *
-   * @param host_audio Host audio.
-   * @param response HTTP response object to populate.
-   * @param request HTTP request data from the client.
+   * @param host_audio Host audio state updated from launch parameters.
+   * @param response HTTPS response object to populate.
+   * @param request HTTPS request data from the client.
+   * @param args Parsed request query parameters.
+   * @param client_cert Verified PEM certificate for the launching client.
+   * @param client_name Friendly name of the launching client.
    */
-  void launch(bool &host_audio, resp_https_t response, req_https_t request) {
-    print_req<SunshineHTTPS>(request);
-
+  void execute_launch_approved(
+    bool &host_audio,
+    resp_https_t response,
+    req_https_t request,
+    const args_t &args,
+    const std::string &client_cert,
+    const std::string &client_name
+  ) {
     pt::ptree tree;
     bool revert_display_configuration {false};
     auto g = util::fail_guard([&]() {
@@ -1397,20 +1915,6 @@ namespace nvhttp {
       }
     });
 
-    auto args = request->parse_query_string();
-    if (
-      args.find("rikey"s) == std::end(args) ||
-      args.find("rikeyid"s) == std::end(args) ||
-      args.find("localAudioPlayMode"s) == std::end(args) ||
-      args.find("appid"s) == std::end(args)
-    ) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 400);
-      tree.put("root.<xmlattr>.status_message", "Missing a required launch parameter");
-
-      return;
-    }
-
     auto appid = util::from_view(get_arg(args, "appid"));
 
     auto current_appid = proc::proc.running();
@@ -1423,7 +1927,7 @@ namespace nvhttp {
     }
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    auto launch_session = make_launch_session(host_audio, args, client_cert, client_name);
 
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
@@ -1488,15 +1992,113 @@ namespace nvhttp {
   }
 
   /**
-   * @brief Resume an existing GameStream session.
+   * @brief Launch the requested application for a GameStream session, holding for approval when configured.
    *
    * @param host_audio Host audio.
-   * @param response HTTP response object to populate.
+   * @param response HTTP response object to populate or hold.
    * @param request HTTP request data from the client.
+   * @param io_service Optional HTTPS server I/O context for expiration timers.
+   * @param post_to_server Optional scheduler that posts approved continuations back onto the HTTPS server thread.
    */
-  void resume(bool &host_audio, resp_https_t response, req_https_t request) {
+  void launch(
+    bool &host_audio,
+    resp_https_t response,
+    req_https_t request,
+    const std::shared_ptr<boost::asio::io_context> &io_service = nullptr,
+    const std::function<void(std::function<void()>)> &post_to_server = {}
+  ) {
     print_req<SunshineHTTPS>(request);
 
+    pt::ptree tree;
+    auto g = util::fail_guard([&]() {
+      std::ostringstream data;
+
+      if (tree.empty()) {
+        BOOST_LOG(error) << EMPTY_PROPERTY_TREE_ERROR_MSG;
+      }
+
+      pt::write_xml(data, tree);
+      response->write(data.str());
+      response->close_connection_after_response = true;
+    });
+
+    auto args = request->parse_query_string();
+    if (
+      args.find("rikey"s) == std::end(args) ||
+      args.find("rikeyid"s) == std::end(args) ||
+      args.find("localAudioPlayMode"s) == std::end(args) ||
+      args.find("appid"s) == std::end(args)
+    ) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Missing a required launch parameter");
+
+      return;
+    }
+
+    if (proc::proc.running() > 0) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "An app is already running on this host");
+
+      return;
+    }
+
+    const auto client_cert = find_verified_request_cert(request);
+    const auto client_record = find_client_by_cert(client_cert);
+    if (client_record && !client_record->enabled) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client is disabled");
+      return;
+    }
+
+    const std::string client_name = client_record ? client_record->name : last_verified_client_name;
+    if (client_record && client_record->require_accept) {
+      const bool queued = hold_for_reconnect_approval(
+        *client_record,
+        request,
+        "launch"s,
+        response,
+        io_service,
+        post_to_server,
+        [&host_audio, request, args, client_cert, client_name](resp_https_t approved_response) {
+          execute_launch_approved(host_audio, std::move(approved_response), request, args, client_cert, client_name);
+        }
+      );
+      if (!queued) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Too many pending connection approval requests");
+        return;
+      }
+
+      g.disable();
+      return;
+    }
+
+    g.disable();
+    execute_launch_approved(host_audio, std::move(response), std::move(request), args, client_cert, client_name);
+  }
+
+  /**
+   * @brief Complete an authorized GameStream session resume and write the XML response.
+   *
+   * @param host_audio Host audio state updated when applicable.
+   * @param response HTTPS response object to populate.
+   * @param request HTTPS request data from the client.
+   * @param args Parsed request query parameters.
+   * @param client_cert Verified PEM certificate for the resuming client.
+   * @param client_name Friendly name of the resuming client.
+   */
+  void execute_resume_approved(
+    bool &host_audio,
+    resp_https_t response,
+    req_https_t request,
+    const args_t &args,
+    const std::string &client_cert,
+    const std::string &client_name
+  ) {
     pt::ptree tree;
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
@@ -1519,18 +2121,6 @@ namespace nvhttp {
       return;
     }
 
-    auto args = request->parse_query_string();
-    if (
-      args.find("rikey"s) == std::end(args) ||
-      args.find("rikeyid"s) == std::end(args)
-    ) {
-      tree.put("root.resume", 0);
-      tree.put("root.<xmlattr>.status_code", 400);
-      tree.put("root.<xmlattr>.status_message", "Missing a required resume parameter");
-
-      return;
-    }
-
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
@@ -1538,7 +2128,7 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    const auto launch_session = make_launch_session(host_audio, args, client_cert, client_name);
 
     if (no_active_sessions) {
       // We want to prepare display only if there are no active sessions at
@@ -1586,6 +2176,95 @@ namespace nvhttp {
   }
 
   /**
+   * @brief Resume an existing GameStream session, holding for approval when configured.
+   *
+   * @param host_audio Host audio.
+   * @param response HTTP response object to populate or hold.
+   * @param request HTTP request data from the client.
+   * @param io_service Optional HTTPS server I/O context for expiration timers.
+   * @param post_to_server Optional scheduler that posts approved continuations back onto the HTTPS server thread.
+   */
+  void resume(
+    bool &host_audio,
+    resp_https_t response,
+    req_https_t request,
+    const std::shared_ptr<boost::asio::io_context> &io_service = nullptr,
+    const std::function<void(std::function<void()>)> &post_to_server = {}
+  ) {
+    print_req<SunshineHTTPS>(request);
+
+    pt::ptree tree;
+    auto g = util::fail_guard([&]() {
+      std::ostringstream data;
+
+      if (tree.empty()) {
+        BOOST_LOG(error) << EMPTY_PROPERTY_TREE_ERROR_MSG;
+      }
+
+      pt::write_xml(data, tree);
+      response->write(data.str());
+      response->close_connection_after_response = true;
+    });
+
+    auto current_appid = proc::proc.running();
+    if (current_appid == 0) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "No running app to resume");
+
+      return;
+    }
+
+    auto args = request->parse_query_string();
+    if (
+      args.find("rikey"s) == std::end(args) ||
+      args.find("rikeyid"s) == std::end(args)
+    ) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Missing a required resume parameter");
+
+      return;
+    }
+
+    const auto client_cert = find_verified_request_cert(request);
+    const auto client_record = find_client_by_cert(client_cert);
+    if (client_record && !client_record->enabled) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client is disabled");
+      return;
+    }
+
+    const std::string client_name = client_record ? client_record->name : last_verified_client_name;
+    if (client_record && client_record->require_accept) {
+      const bool queued = hold_for_reconnect_approval(
+        *client_record,
+        request,
+        "resume"s,
+        response,
+        io_service,
+        post_to_server,
+        [&host_audio, request, args, client_cert, client_name](resp_https_t approved_response) {
+          execute_resume_approved(host_audio, std::move(approved_response), request, args, client_cert, client_name);
+        }
+      );
+      if (!queued) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Too many pending connection approval requests");
+        return;
+      }
+
+      g.disable();
+      return;
+    }
+
+    g.disable();
+    execute_resume_approved(host_audio, std::move(response), std::move(request), args, client_cert, client_name);
+  }
+
+  /**
    * @brief Check whether cel.
    *
    * @param response HTTP response object to populate.
@@ -1602,6 +2281,21 @@ namespace nvhttp {
       response->write(data.str());
       response->close_connection_after_response = true;
     });
+
+    const auto client_cert = find_verified_request_cert(request);
+    const auto client_record = find_client_by_cert(client_cert);
+    if (client_record && !client_record->enabled) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client is disabled");
+      return;
+    }
+    if (client_record && client_record->require_accept) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Client is not permitted to cancel the session");
+      return;
+    }
 
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
@@ -1721,6 +2415,19 @@ namespace nvhttp {
       return verified;
     };
 
+    https_server.on_verified = [](const req_https_t &request, SSL *ssl) {
+      crypto::x509_t x509 {
+#if OPENSSL_VERSION_MAJOR >= 3
+        SSL_get1_peer_certificate(ssl)
+#else
+        SSL_get_peer_certificate(ssl)
+#endif
+      };
+      if (x509) {
+        store_verified_request_cert(request, crypto::pem(x509));
+      }
+    };
+
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
       pt::ptree tree;
       auto g = util::fail_guard([&tree, &resp]() {
@@ -1736,6 +2443,10 @@ namespace nvhttp {
       tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
     };
 
+    auto post_to_https_server = [&https_server](std::function<void()> callback) {
+      https_server.post_guarded(std::move(callback));
+    };
+
     https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
     https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SunshineHTTPS>;
     https_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
@@ -1743,11 +2454,11 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
-    https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
-      launch(host_audio, resp, req);
+    https_server.resource["^/launch$"]["GET"] = [&host_audio, &https_server, post_to_https_server](auto resp, auto req) {
+      launch(host_audio, resp, req, https_server.io_service, post_to_https_server);
     };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio](auto resp, auto req) {
-      resume(host_audio, resp, req);
+    https_server.resource["^/resume$"]["GET"] = [&host_audio, &https_server, post_to_https_server](auto resp, auto req) {
+      resume(host_audio, resp, req, https_server.io_service, post_to_https_server);
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
 
@@ -1787,6 +2498,7 @@ namespace nvhttp {
     // Wait for any event
     shutdown_event->view();
 
+    cancel_all_pending_reconnects();
     https_server.stop();
     http_server.stop();
 
@@ -1795,35 +2507,65 @@ namespace nvhttp {
   }
 
   void erase_all_clients() {
-    std::lock_guard lock {client_auth_mutex()};
-    client_root = {};
-    cert_chain.clear();
-    save_state();
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      client_root = {};
+      cert_chain.clear();
+      save_state();
+    }
+    cancel_all_pending_reconnects();
   }
 
   bool unpair_client(const std::string_view uuid) {
-    std::lock_guard lock {client_auth_mutex()};
     bool removed = false;
-    for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
-      if ((*it).uuid == uuid) {
-        it = client_root.named_devices.erase(it);
-        removed = true;
-      } else {
-        ++it;
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
+        if ((*it).uuid == uuid) {
+          it = client_root.named_devices.erase(it);
+          removed = true;
+        } else {
+          ++it;
+        }
       }
+
+      rebuild_client_cert_chain();
+      save_state();
     }
 
-    rebuild_client_cert_chain();
-    save_state();
+    if (removed) {
+      cancel_pending_reconnects_for_client(uuid);
+    }
     return removed;
   }
 
   bool set_client_enabled(const std::string_view uuid, bool enabled) {
+    bool updated = false;
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      for (auto &named_cert : client_root.named_devices) {
+        if (named_cert.uuid == uuid) {
+          named_cert.enabled = enabled;
+          rebuild_client_cert_chain();
+          save_state();
+          updated = true;
+          break;
+        }
+      }
+    }
+
+    if (updated && !enabled) {
+      cancel_pending_reconnects_for_client(uuid);
+    }
+    return updated;
+  }
+
+  bool set_client_require_accept(const std::string_view uuid, const bool require_accept) {
     std::lock_guard lock {client_auth_mutex()};
     for (auto &named_cert : client_root.named_devices) {
       if (named_cert.uuid == uuid) {
-        named_cert.enabled = enabled;
-        rebuild_client_cert_chain();
+        named_cert.require_accept = require_accept;
+        // TODO: I think we need to clean up pending reconnects here if require_accept is false
         save_state();
         return true;
       }
@@ -1886,9 +2628,16 @@ namespace nvhttp {
     }
 
     void reset_client_state() {
+      cancel_all_pending_reconnects();
+      {
+        std::lock_guard cert_lock {verified_request_certs_mutex()};
+        verified_request_certs().clear();
+      }
       std::lock_guard lock {client_auth_mutex()};
       client_root = {};
       cert_chain.clear();
+      last_verified_client_cert.clear();
+      last_verified_client_name.clear();
     }
 
     std::string add_client(const std::string &name, std::string cert, bool enabled) {
@@ -1940,6 +2689,130 @@ namespace nvhttp {
 
     void reload_client_state() {
       load_state();
+    }
+
+    std::string enqueue_reconnect_for_testing(
+      const std::string_view uuid,
+      std::string address,
+      std::string action,
+      std::function<void()> on_approve
+    ) {
+      const auto client = find_client_by_uuid(uuid);
+      if (!client) {
+        return {};
+      }
+
+      const bool queued = enqueue_reconnect_approval(
+        *client,
+        std::move(address),
+        std::move(action),
+        nullptr,
+        nullptr,
+        [cb = std::move(on_approve)](resp_https_t) mutable {
+          if (cb) {
+            cb();
+          }
+        }
+      );
+      if (!queued) {
+        return {};
+      }
+
+      std::lock_guard lock {reconnect_mutex()};
+      const auto &entries = pending_reconnect_entries();
+      const auto it = std::ranges::find(entries, uuid, &pending_reconnect_entry_t::client_uuid);
+      return it != entries.end() ? it->id : std::string {};
+    }
+
+    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_stream_https_server(
+      const std::string &certificate_file,
+      const std::string &private_key_file,
+      bool &host_audio
+    ) {
+      auto server = std::make_unique<SunshineHTTPSServer>(certificate_file, private_key_file);
+      auto *raw_server = server.get();
+
+      server->verify = [](SSL *ssl) {
+        crypto::x509_t x509 {
+  #if OPENSSL_VERSION_MAJOR >= 3
+          SSL_get1_peer_certificate(ssl)
+  #else
+          SSL_get_peer_certificate(ssl)
+  #endif
+        };
+        if (!x509) {
+          return 0;
+        }
+
+        std::lock_guard lock {client_auth_mutex()};
+        if (verify_client_certificate(x509.get()) != nullptr) {
+          return 0;
+        }
+
+        auto pem = crypto::pem(x509);
+        auto [enabled, client_name] = get_client_status(pem);
+        if (!enabled) {
+          return 0;
+        }
+
+        last_verified_client_cert = pem;
+        last_verified_client_name = client_name;
+        return 1;
+      };
+
+      server->on_verified = [](const req_https_t &request, SSL *ssl) {
+        crypto::x509_t x509 {
+  #if OPENSSL_VERSION_MAJOR >= 3
+          SSL_get1_peer_certificate(ssl)
+  #else
+          SSL_get_peer_certificate(ssl)
+  #endif
+        };
+        if (x509) {
+          store_verified_request_cert(request, crypto::pem(x509));
+        }
+      };
+
+      server->on_verify_failed = [](resp_https_t resp, req_https_t req) {
+        pt::ptree tree;
+        tree.put("root.<xmlattr>.status_code"s, 401);
+        tree.put("root.<xmlattr>.query"s, req->path);
+        tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
+        std::ostringstream data;
+        pt::write_xml(data, tree);
+        resp->write(data.str());
+        resp->close_connection_after_response = true;
+      };
+
+      auto post_to_https_server = [raw_server](std::function<void()> callback) {
+        raw_server->post_guarded(std::move(callback));
+      };
+
+      server->resource["^/launch$"]["GET"] = [&host_audio, raw_server, post_to_https_server](auto resp, auto req) {
+        launch(host_audio, resp, req, raw_server->io_service, post_to_https_server);
+      };
+      server->resource["^/resume$"]["GET"] = [&host_audio, raw_server, post_to_https_server](auto resp, auto req) {
+        resume(host_audio, resp, req, raw_server->io_service, post_to_https_server);
+      };
+      server->resource["^/cancel$"]["GET"] = cancel;
+      return server;
+    }
+
+    std::string wait_for_pending_reconnect_id(
+      const std::string_view previous_id,
+      const std::chrono::milliseconds timeout
+    ) {
+      std::unique_lock lock {reconnect_mutex()};
+      std::string matched_id;
+      reconnect_condition().wait_for(lock, timeout, [&]() {
+        const auto &entries = pending_reconnect_entries();
+        if (!entries.empty() && entries.front().id != previous_id) {
+          matched_id = entries.front().id;
+          return true;
+        }
+        return false;
+      });
+      return matched_id;
     }
   }  // namespace test_support
 #endif

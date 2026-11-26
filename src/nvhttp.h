@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -71,6 +72,16 @@ namespace nvhttp {
    * @brief Lifetime of an incomplete pairing session.
    */
   constexpr auto PAIRING_SESSION_TIMEOUT = std::chrono::minutes {5};
+
+  /**
+   * @brief Maximum number of pending reconnect approval requests retained at one time.
+   */
+  constexpr std::size_t MAX_PENDING_RECONNECT_REQUESTS = 8;
+
+  /**
+   * @brief Lifetime of a held reconnect approval request before it times out.
+   */
+  constexpr auto RECONNECT_APPROVAL_TIMEOUT = std::chrono::minutes {2};
 
   /**
    * @brief Start the nvhttp server.
@@ -172,6 +183,17 @@ namespace nvhttp {
     std::string id;  ///< Unguessable approval identifier.
     std::string name;  ///< Untrusted device name reported by the pairing client.
     std::string address;  ///< Network address from which the request originated.
+  };
+
+  /**
+   * @brief Operator-visible context for a paired client awaiting reconnect approval.
+   */
+  struct pending_reconnect_t {
+    std::string id;  ///< Unguessable approval identifier.
+    std::string client_uuid;  ///< Persistent UUID of the paired client.
+    std::string name;  ///< Friendly paired-client name assigned in Sunshine.
+    std::string address;  ///< Network address from which the request originated.
+    std::string action;  ///< Requested GameStream action ("launch" or "resume").
   };
 
   /**
@@ -355,6 +377,38 @@ namespace nvhttp {
    * @return true if the client was found and updated.
    */
   bool set_client_enabled(std::string_view uuid, bool enabled);
+
+  /**
+   * @brief Require or waive operator reconnect approval for a paired client.
+   *
+   * @param uuid Persistent UUID of the paired client.
+   * @param require_accept Whether starting or resuming a stream requires operator approval.
+   * @return `true` if the client was found and updated.
+   */
+  bool set_client_require_accept(std::string_view uuid, bool require_accept);
+
+  /**
+   * @brief List paired-client reconnect requests currently waiting for operator approval.
+   *
+   * @return Pending reconnect requests ordered from oldest to newest.
+   */
+  std::vector<pending_reconnect_t> get_pending_reconnects();
+
+  /**
+   * @brief Approve or deny a pending paired-client reconnect request.
+   *
+   * @param request_id Unguessable approval identifier returned by @ref get_pending_reconnects.
+   * @param approve `true` to continue the held launch/resume request; `false` to reject it.
+   * @return `true` when the pending request was found and resolved.
+   */
+  bool resolve_pending_reconnect(std::string_view request_id, bool approve);
+
+  /**
+   * @brief Expire pending reconnect approval requests whose deadline has passed.
+   *
+   * @param now Monotonic time used to evaluate request deadlines.
+   */
+  void expire_pending_reconnects(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
   /**
    * @brief Get cert by UUID.
    *
@@ -461,6 +515,48 @@ namespace nvhttp {
      * @brief Reload paired-client authorization state from the configured state file.
      */
     void reload_client_state();
+
+    /**
+     * @brief Enqueue a pending reconnect approval entry for a paired client in unit tests.
+     *
+     * @param uuid Persistent UUID of the paired client.
+     * @param address Remote client network address.
+     * @param action Requested GameStream action ("launch" or "resume").
+     * @param on_approve Optional callback invoked if the request is approved.
+     * @return Generated approval request ID, or an empty string if queueing failed.
+     */
+    std::string enqueue_reconnect_for_testing(
+      std::string_view uuid,
+      std::string address,
+      std::string action,
+      std::function<void()> on_approve = {}
+    );
+
+    /**
+     * @brief Create an HTTPS server configured with production client-cert verification and `/launch` + `/resume` routes.
+     *
+     * @param certificate_file Path to the server certificate PEM file.
+     * @param private_key_file Path to the matching private key PEM file.
+     * @param host_audio Mutable host-audio flag updated by `/launch` and `/resume`.
+     * @return Configured HTTPS server ready for loopback test requests.
+     */
+    std::unique_ptr<SimpleWeb::ServerBase<SunshineHTTPS>> make_stream_https_server(
+      const std::string &certificate_file,
+      const std::string &private_key_file,
+      bool &host_audio
+    );
+
+    /**
+     * @brief Block until a pending reconnect request with an ID different from `previous_id` is queued.
+     *
+     * @param previous_id Previously observed request ID to skip, or empty for any pending request.
+     * @param timeout Maximum duration to wait.
+     * @return Queued request ID, or an empty string on timeout.
+     */
+    std::string wait_for_pending_reconnect_id(
+      std::string_view previous_id = {},
+      std::chrono::milliseconds timeout = std::chrono::seconds {2}
+    );
   }  // namespace test_support
 #endif
 }  // namespace nvhttp

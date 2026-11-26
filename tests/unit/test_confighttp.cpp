@@ -8,6 +8,7 @@
  */
 
 // test includes
+#include "../certificate_test_utils.h"
 #include "../tests_common.h"
 
 // standard includes
@@ -109,6 +110,8 @@ protected:
   std::string saved_password;
   std::string saved_salt;
   std::string saved_locale;
+  std::string saved_state_file;
+  bool saved_fresh_state = false;
   std::vector<std::string> saved_csrf_allowed_origins;
   std::filesystem::path test_web_dir;
   std::filesystem::path cert_file;
@@ -136,6 +139,8 @@ protected:
     saved_password = config::sunshine.password;
     saved_salt = config::sunshine.salt;
     saved_locale = config::sunshine.locale;
+    saved_state_file = config::nvhttp.file_state;
+    saved_fresh_state = config::sunshine.flags[config::flag::FRESH_STATE];
     saved_csrf_allowed_origins = config::sunshine.csrf_allowed_origins;
 
     // Set up test credentials
@@ -157,6 +162,9 @@ protected:
     // Create test web directory in temp
     test_web_dir = std::filesystem::temp_directory_path() / "sunshine_test_confighttp";  // NOSONAR(cpp:S5443): safe for tests
     std::filesystem::create_directories(test_web_dir / "web");
+    config::nvhttp.file_state = (test_web_dir / "sunshine_state.json").string();
+    config::sunshine.flags[config::flag::FRESH_STATE] = false;
+    nvhttp::test_support::reset_client_state();
     confighttp::set_portal_token_path_provider_for_testing([this]() {
       return test_web_dir / "portal_token";
     });
@@ -343,6 +351,10 @@ protected:
     server->resource["^/pairing-test$"]["DELETE"] = confighttp::cancelPairing;
     server->resource["^/pairing-test$"]["GET"] = confighttp::getPendingPairings;
     server->resource["^/pairing-test$"]["POST"] = confighttp::savePin;
+    server->resource["^/clients-list-test$"]["GET"] = confighttp::getClients;
+    server->resource["^/clients-update-test$"]["POST"] = confighttp::updateClient;
+    server->resource["^/clients-reconnect-test$"]["GET"] = confighttp::getPendingReconnects;
+    server->resource["^/clients-reconnect-test$"]["POST"] = confighttp::resolvePendingReconnect;
     server->resource["^/portal-token-reset-test$"]["POST"] = confighttp::resetPortalToken;
     server->resource["^/api/apps$"]["POST"] = confighttp::saveApp;
     server->default_resource["GET"] = confighttp::getFallbackPage;
@@ -386,7 +398,10 @@ protected:
     config::sunshine.password = saved_password;
     config::sunshine.salt = saved_salt;
     config::sunshine.locale = saved_locale;
+    config::nvhttp.file_state = saved_state_file;
+    config::sunshine.flags[config::flag::FRESH_STATE] = saved_fresh_state;
     config::sunshine.csrf_allowed_origins = saved_csrf_allowed_origins;
+    nvhttp::test_support::reset_client_state();
     nvhttp::expire_pair_sessions(std::chrono::steady_clock::time_point::max());
 
     // Clean up test HTML file from WEB_DIR
@@ -572,6 +587,8 @@ INSTANTIATE_TEST_SUITE_P(
     endpoint_request_t {"CsrfToken", "GET", "/csrf-token-test", ""},
     endpoint_request_t {"BrowseDirectory", "GET", "/browse-test", ""},
     endpoint_request_t {"PairingList", "GET", "/pairing-test", ""},
+    endpoint_request_t {"ClientsList", "GET", "/clients-list-test", ""},
+    endpoint_request_t {"ClientsReconnectList", "GET", "/clients-reconnect-test", ""},
     endpoint_request_t {"PortalTokenReset", "POST", "/portal-token-reset-test", ""},
     endpoint_request_t {"VirtualInputStatus", "GET", "/virtual-input-status-test", ""},
     endpoint_request_t {"VirtualInputLicense", "GET", "/virtual-input-license-test", ""},
@@ -751,6 +768,179 @@ TEST_F(ConfigHttpTest, PairingRestApiReportsIncompleteHandshakeAsFailure) {
   ASSERT_EQ(response->status_code, "200 OK");
   EXPECT_FALSE(nlohmann::json::parse(response->content.string()).at("status").get<bool>());
   EXPECT_TRUE(nvhttp::get_pending_pairings().empty());
+}
+
+TEST_F(ConfigHttpTest, ClientUpdateAndReconnectMutationsRejectUnauthenticatedAndCsrfRequests) {
+  SimpleWeb::CaseInsensitiveMultimap unauth_headers;
+  unauth_headers.emplace("Content-Type", "application/json");
+
+  EXPECT_EQ(
+    client->request("POST", "/clients-update-test", R"({"uuid":"u1","require_accept":true})", unauth_headers)->status_code,
+    "401 Unauthorized"
+  );
+  EXPECT_EQ(
+    client->request(
+            "POST",
+            "/clients-reconnect-test",
+            R"({"request_id":"AAAAAAAA-AAAA-4AAA-BAAA-AAAAAAAAAAAA","approve":true})",
+            unauth_headers
+    )
+      ->status_code,
+    "401 Unauthorized"
+  );
+
+  SimpleWeb::CaseInsensitiveMultimap csrf_headers;
+  csrf_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  csrf_headers.emplace("Content-Type", "application/json");
+  csrf_headers.emplace("Origin", "https://example.invalid");
+
+  const auto update_csrf = client->request(
+    "POST",
+    "/clients-update-test",
+    R"({"uuid":"u1","require_accept":true})",
+    csrf_headers
+  );
+  EXPECT_EQ(update_csrf->status_code, "400 Bad Request");
+  EXPECT_TRUE(update_csrf->content.string().contains("Missing CSRF token"));
+
+  const auto reconnect_csrf = client->request(
+    "POST",
+    "/clients-reconnect-test",
+    R"({"request_id":"aaaaaaaa-aaaa-4aaa-baaa-aaaaaaaaaaaa","approve":true})",
+    csrf_headers
+  );
+  EXPECT_EQ(reconnect_csrf->status_code, "400 Bad Request");
+  EXPECT_TRUE(reconnect_csrf->content.string().contains("Missing CSRF token"));
+}
+
+TEST_F(ConfigHttpTest, ClientUpdateRestApiUpdatesEnabledAndRequireAcceptFlagsAndValidatesInput) {
+  const auto creds = test_utils::certificates::generate_ca_credentials("ConfigHttp Client");
+  const auto uuid = nvhttp::test_support::add_client("Steam Deck", creds.x509, true);
+  ASSERT_FALSE(uuid.empty());
+
+  SimpleWeb::CaseInsensitiveMultimap headers;
+  headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  headers.emplace("Content-Type", "application/json");
+
+  auto expect_bad_update = [&](const std::string &payload) {
+    EXPECT_EQ(client->request("POST", "/clients-update-test", payload, headers)->status_code, "400 Bad Request");
+  };
+  expect_bad_update("not-json");
+  expect_bad_update(R"([])");
+  expect_bad_update(R"({"enabled":true})");
+  expect_bad_update(R"({"uuid":"","enabled":true})");
+  expect_bad_update(std::format(R"({{"uuid":"{}","require_accept":"yes"}})", uuid));
+  expect_bad_update(std::format(R"({{"uuid":"{}","enabled":"no"}})", uuid));
+
+  const auto enable_require = client->request(
+    "POST",
+    "/clients-update-test",
+    nlohmann::json {{"uuid", uuid}, {"require_accept", true}}.dump(),
+    headers
+  );
+  ASSERT_EQ(enable_require->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(enable_require->content.string()).at("status").get<bool>());
+
+  SimpleWeb::CaseInsensitiveMultimap get_headers;
+  get_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto list_response = client->request("GET", "/clients-list-test", "", get_headers);
+  ASSERT_EQ(list_response->status_code, "200 OK");
+  const auto listed = nlohmann::json::parse(list_response->content.string()).at("named_certs");
+  ASSERT_EQ(listed.size(), 1);
+  EXPECT_EQ(listed.front().at("uuid"), uuid);
+  EXPECT_TRUE(listed.front().at("enabled").get<bool>());
+  EXPECT_TRUE(listed.front().at("require_accept").get<bool>());
+
+  const auto disable_client = client->request(
+    "POST",
+    "/clients-update-test",
+    nlohmann::json {{"uuid", uuid}, {"enabled", false}, {"require_accept", false}}.dump(),
+    headers
+  );
+  ASSERT_EQ(disable_client->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(disable_client->content.string()).at("status").get<bool>());
+
+  const auto updated_list = nlohmann::json::parse(
+                              client->request("GET", "/clients-list-test", "", get_headers)->content.string()
+  )
+                              .at("named_certs");
+  ASSERT_EQ(updated_list.size(), 1);
+  EXPECT_FALSE(updated_list.front().at("enabled").get<bool>());
+  EXPECT_FALSE(updated_list.front().at("require_accept").get<bool>());
+
+  // Legacy quirk: If only uuid is passed then `enabled` is assumed true
+  const auto default_enable = client->request(
+    "POST",
+    "/clients-update-test",
+    nlohmann::json {{"uuid", uuid}}.dump(),
+    headers
+  );
+  ASSERT_EQ(default_enable->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(default_enable->content.string()).at("status").get<bool>());
+
+  const auto reenabled_list = nlohmann::json::parse(
+                                client->request("GET", "/clients-list-test", "", get_headers)->content.string()
+  )
+                                .at("named_certs");
+  ASSERT_EQ(reenabled_list.size(), 1);
+  EXPECT_TRUE(reenabled_list.front().at("enabled").get<bool>());
+}
+
+TEST_F(ConfigHttpTest, ClientReconnectRestApiListsValidatesAndResolvesPendingRequests) {
+  const auto creds = test_utils::certificates::generate_ca_credentials("Reconnect REST Client");
+  const auto uuid = nvhttp::test_support::add_client("Living Room TV", creds.x509, true);
+  ASSERT_FALSE(uuid.empty());
+
+  bool approved = false;
+  const auto request_id = nvhttp::test_support::enqueue_reconnect_for_testing(
+    uuid,
+    "192.0.2.55",
+    "launch",
+    [&approved]() {
+      approved = true;
+    }
+  );
+  ASSERT_FALSE(request_id.empty());
+
+  SimpleWeb::CaseInsensitiveMultimap get_headers;
+  get_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  const auto list_response = client->request("GET", "/clients-reconnect-test", "", get_headers);
+  ASSERT_EQ(list_response->status_code, "200 OK");
+  const auto list_body = nlohmann::json::parse(list_response->content.string());
+  EXPECT_TRUE(list_body.at("status").get<bool>());
+  ASSERT_EQ(list_body.at("reconnects").size(), 1);
+  EXPECT_EQ(list_body.at("reconnects").front().at("id"), request_id);
+  EXPECT_EQ(list_body.at("reconnects").front().at("client_uuid"), uuid);
+  EXPECT_EQ(list_body.at("reconnects").front().at("name"), "Living Room TV");
+  EXPECT_EQ(list_body.at("reconnects").front().at("address"), "192.0.2.55");
+  EXPECT_EQ(list_body.at("reconnects").front().at("action"), "launch");
+
+  SimpleWeb::CaseInsensitiveMultimap post_headers;
+  post_headers.emplace("Authorization", create_auth_header("testuser", "testpass"));
+  post_headers.emplace("Content-Type", "application/json");
+
+  const std::array<std::string, 5> invalid_requests {
+    "not-json",
+    R"([])",
+    R"({"request_id":"short","approve":true})",
+    std::format(R"({{"request_id":"{}"}})", request_id),
+    std::format(R"({{"request_id":"{}","approve":"yes"}})", request_id),
+  };
+  for (const auto &invalid_body : invalid_requests) {
+    EXPECT_EQ(client->request("POST", "/clients-reconnect-test", invalid_body, post_headers)->status_code, "400 Bad Request");
+  }
+  EXPECT_EQ(nvhttp::get_pending_reconnects().size(), 1);
+
+  const auto approve_response = client->request(
+    "POST",
+    "/clients-reconnect-test",
+    nlohmann::json {{"request_id", request_id}, {"approve", true}}.dump(),
+    post_headers
+  );
+  ASSERT_EQ(approve_response->status_code, "200 OK");
+  EXPECT_TRUE(nlohmann::json::parse(approve_response->content.string()).at("status").get<bool>());
+  EXPECT_TRUE(approved);
+  EXPECT_TRUE(nvhttp::get_pending_reconnects().empty());
 }
 
 TEST_F(ConfigHttpTest, PortalTokenResetHandlesSavedTokenForCurrentPlatform) {

@@ -131,6 +131,15 @@ namespace system_tray {
    */
   void update_tray_require_pin();
 
+  /**
+   * @brief Spawns a notification when a paired client requires reconnect approval.
+   *
+   * Clicking the notification opens the Sunshine Web UI so the operator can accept or deny the connection.
+   *
+   * @param client_name Friendly name of the paired client requesting to reconnect.
+   */
+  void update_tray_require_reconnect(std::string_view client_name);
+
 #if defined(_WIN32) || defined(__APPLE__)
   /**
    * @brief Update the Virtual HID Broker license submenu and optional notification.

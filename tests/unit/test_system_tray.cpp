@@ -243,6 +243,12 @@ namespace {
 
     system_tray::update_tray_require_pin();
     verify_state(0, PROJECT_NAME, "Incoming Pairing Request", "Click here to complete the pairing process", 1, true);
+
+    system_tray::update_tray_require_reconnect("Living Room TV");
+    verify_state(0, PROJECT_NAME, "Incoming Connection Request", "Living Room TV is requesting to reconnect. Click here to review.", 1, true);
+
+    system_tray::update_tray_require_reconnect("");
+    verify_state(0, PROJECT_NAME, "Incoming Connection Request", "An unknown device is requesting to reconnect. Click here to review.", 1, true);
   }
   #endif
 }  // namespace
@@ -329,6 +335,7 @@ TEST_F(SystemTrayTest, UpdatesAreIgnoredBeforeInitialization) {
   system_tray::update_tray_pausing("Moonlight");
   system_tray::update_tray_stopped("Moonlight");
   system_tray::update_tray_require_pin();
+  system_tray::update_tray_require_reconnect("Living Room TV");
 
   const auto &tray_data = system_tray::tray_data_for_testing();
   EXPECT_STREQ(tray_data.icon, tray_data.allIconPaths[0]);

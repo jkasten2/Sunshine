@@ -117,6 +117,38 @@ namespace confighttp {
   void savePin(const resp_https_t &response, const req_https_t &request);
 
   /**
+   * @brief List paired clients and their per-device flags.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void getClients(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Update per-device settings (`enabled` and/or `require_accept`) for a paired client.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void updateClient(resp_https_t response, req_https_t request);
+
+  /**
+   * @brief List paired-client reconnect requests waiting for operator approval.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void getPendingReconnects(const resp_https_t &response, const req_https_t &request);
+
+  /**
+   * @brief Approve or deny an explicitly selected paired-client reconnect request.
+   *
+   * @param response HTTP response object to populate.
+   * @param request HTTP request data from the client.
+   */
+  void resolvePendingReconnect(const resp_https_t &response, const req_https_t &request);
+
+  /**
    * @brief Check whether a detected driver version identifies a development build.
    *
    * Numeric versions beginning with `0.0` and containing at least three
